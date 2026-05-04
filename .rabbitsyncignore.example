@@ -1,0 +1,10 @@
+# RabbitSync ignore file (example).
+# Same syntax as .gitignore. Place this file at the source folder's root as
+# `.rabbitsyncignore` to add additional excludes on top of .gitignore for sync.
+# These rules ONLY affect what RabbitSync copies during sync; they do not
+# affect git itself.
+
+# Examples:
+# *.local
+# secrets/
+# build-cache/

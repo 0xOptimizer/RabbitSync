@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rabbitsync"
+version = "0.1.0"
+description = "Safe source-to-copy folder sync with git management and CI/CD pipelines."
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "RabbitSync" }]
+dependencies = [
+    "PySide6>=6.7",
+    "pydantic>=2.7",
+    "structlog>=24.1",
+    "xxhash>=3.4",
+    "zstandard>=0.22",
+    "pathspec>=0.12",
+    "keyring>=25",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-qt>=4.4",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "vulture>=2.11",
+    "pip-audit>=2.7",
+]
+
+[project.scripts]
+rabbitsync = "rabbitsync.app:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["rabbitsync*"]
+
+[tool.setuptools.package-data]
+rabbitsync = [
+    "assets/icons/lucide/*.svg",
+    "assets/icons/lucide/INDEX.json",
+    "assets/*.ico",
+    "db/schema.sql",
+    "db/migrations/*.sql",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "SIM", "C4", "RET", "PTH", "RSE", "TID",
+    "S",
+]
+ignore = [
+    "S101",
+    "E501",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+"tools/**" = ["S"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+explicit_package_bases = true
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["xxhash", "zstandard", "pathspec", "keyring.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.vulture]
+paths = ["src"]
+min_confidence = 80

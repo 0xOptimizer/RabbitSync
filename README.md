@@ -47,26 +47,10 @@ python main.py
 
 ## Connecting GitHub
 
-RabbitSync uses a GitHub Personal Access Token (PAT) — there is no OAuth flow.
-
-### Option A — Fine-grained token (recommended)
-
-1. Open <https://github.com/settings/personal-access-tokens/new>.
-2. **Token name**: `RabbitSync` (or include your machine name, e.g. `RabbitSync — work-laptop`).
-3. **Expiration**: 90 days is a sensible default.
-4. **Resource owner**: your account (or an org you administer).
-5. **Repository access**: `Public Repositories (read-only)` for browsing public repos, `All repositories` for listing/cloning your private repos, or `Only select repositories` to scope it tighter.
-6. **Permissions** → **Repository permissions**:
-   - **Contents**: **Read** (required for clone and metadata).
-   - **Metadata**: **Read** (auto-selected).
-   - Bump **Contents** to **Read and write** only if you want RabbitSync to push over HTTPS using this token.
-7. Click **Generate token** and copy the value (it starts with `github_pat_`). It is shown once.
-8. In RabbitSync, open the burger menu → **Connect GitHub…**, paste the token, click **Verify & Save**. The token is stored in Windows Credential Manager — never in SQLite, never on disk in plaintext.
-
-### Option B — Classic token
+RabbitSync uses a GitHub Personal Access Token (PAT):
 
 1. Open <https://github.com/settings/tokens/new>.
-2. **Note**: `RabbitSync`. **Expiration**: 90 days.
+2. **Note**: `RabbitSync`. **Expiration**: 90 days (or no expiration).
 3. **Scopes**: tick `repo` (or `public_repo` for read-only public access).
 4. Generate, copy the value (starts with `ghp_`), and paste into Connect GitHub as above.
 
@@ -83,5 +67,3 @@ data/
   logs/                   Rotated structured JSONL log files.
   .lock                   Global app instance lock.
 ```
-
-See the [plan file](C:/Users/Admin/.claude/plans/hey-this-is-a-frolicking-rain.md) for the full architecture.

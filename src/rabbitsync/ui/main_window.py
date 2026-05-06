@@ -439,6 +439,9 @@ class MainWindow(QMainWindow):
             copy_folder=copy,
             writer=self._writer,
             sample_rate=self._settings.diff_sample_rate,
+            commit_on_sync=self._pair_view.commit_on_sync,
+            auto_push=self._pair_view.auto_push,
+            target_branch=self._pair_view.target_branch,
         )
         self._sync_worker.moveToThread(self._sync_thread)
         self._sync_thread.started.connect(self._sync_worker.run)
@@ -453,17 +456,31 @@ class MainWindow(QMainWindow):
         self._log_dock.reveal()
 
     def _on_sync_finished(self, outcome) -> None:  # noqa: ANN001
-        self._status_bar.set_status(
-            f"Sync {outcome.status} · "
-            f"+{outcome.files_added} ~{outcome.files_modified} -{outcome.files_quarantined}"
+        commit_short = (
+            outcome.copy_commit_sha[:7] if getattr(outcome, "copy_commit_sha", None) else None
         )
-        msg = (
-            f"Status: {outcome.status}\n"
+        bits = [
+            f"+{outcome.files_added} ~{outcome.files_modified} -{outcome.files_quarantined}",
+        ]
+        if commit_short:
+            bits.append(f"committed {commit_short}")
+        if getattr(outcome, "pushed", False):
+            bits.append("pushed")
+        self._status_bar.set_status(f"Sync {outcome.status} · " + " · ".join(bits))
+
+        lines = [
+            f"Status: {outcome.status}",
             f"Added: {outcome.files_added}  Modified: {outcome.files_modified}  "
-            f"Quarantined: {outcome.files_quarantined}"
-        )
-        QMessageBox.information(self, "Sync complete", msg)
-        self._toaster.info("Sync complete", msg.replace("\n", " · "))
+            f"Quarantined: {outcome.files_quarantined}",
+        ]
+        if outcome.commit_message:
+            lines.append("")
+            lines.append(f"Commit: {commit_short}")
+            lines.append(f"Message: {outcome.commit_message}")
+        if outcome.pushed:
+            lines.append("Pushed to remote.")
+        QMessageBox.information(self, "Sync complete", "\n".join(lines))
+        self._toaster.info("Sync complete", " · ".join(bits))
         self._refresh_current_pair_view()
         self._maybe_run_post_sync_pipelines(outcome)
 
@@ -555,6 +572,7 @@ class MainWindow(QMainWindow):
         plan = diff(source_folder=source, copy_folder=copy, rules=rules, sample_rate=0)
         DiffPreviewDialog(
             plan=plan, source_folder=source, copy_folder=copy,
+            on_sync=self._on_sync_clicked,
             theme=self._theme, parent=self,
         ).exec()
 
@@ -580,6 +598,8 @@ class MainWindow(QMainWindow):
                 git_ops_dlg.branch_dialog(self, ctx)
             elif action == "stash":
                 git_ops_dlg.stash_save(self, ctx)
+            elif action == "quick_push":
+                git_ops_dlg.quick_push(self, ctx)
         finally:
             self._refresh_current_pair_view()
 

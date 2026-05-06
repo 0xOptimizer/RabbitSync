@@ -81,6 +81,17 @@ class PairView(QTabWidget):
         self._copy_ctx = copy_ctx
         self._git_tab.show_contexts(source=source_ctx, copy=copy_ctx)
 
+        # Populate the target-branch dropdown from copy's local branches.
+        if copy_ctx.has_git:
+            from rabbitsync.core.git_info import branches as list_branches, status as repo_status
+
+            bs = [b.name for b in list_branches(copy_ctx)]
+            cur = repo_status(copy_ctx)
+            current = cur.branch if cur is not None else None
+            self._sync_tab._settings.set_branches(bs, current)  # noqa: SLF001
+        else:
+            self._sync_tab._settings.set_branches([], None)     # noqa: SLF001
+
     def set_pipelines(self, rows: list[dict]) -> None:
         self._git_tab.set_pipelines(rows)
 
@@ -100,6 +111,22 @@ class PairView(QTabWidget):
     @property
     def copy_ctx(self) -> GitContext | None:
         return self._copy_ctx
+
+    @property
+    def sync_tab(self) -> SyncTab:
+        return self._sync_tab
+
+    @property
+    def commit_on_sync(self) -> bool:
+        return self._sync_tab._settings.commit_on_sync  # noqa: SLF001
+
+    @property
+    def auto_push(self) -> bool:
+        return self._sync_tab._settings.auto_push  # noqa: SLF001
+
+    @property
+    def target_branch(self) -> str | None:
+        return self._sync_tab._settings.target_branch  # noqa: SLF001
 
 
 __all__ = ["PairView"]

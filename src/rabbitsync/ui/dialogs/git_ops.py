@@ -84,6 +84,103 @@ def push(parent: QWidget, ctx: GitContext) -> None:
     _OutputDialog(title="git push", body=body, ok=result.ok, parent=parent).exec()
 
 
+def quick_push(parent: QWidget, ctx: GitContext) -> None:
+    """Stage all → auto-generate ``RabbitSync: …`` message → commit → push.
+
+    Confirms the generated message with the user before committing.
+    """
+    from rabbitsync.core import commit_messages
+
+    runner = _runner(ctx)
+
+    # Stage everything in the registered subpath (or the whole repo).
+    target = ctx.subpath if ctx.subpath else "."
+    try:
+        runner.run(["add", "-A", "--", target], check=True, timeout=60)
+    except GitCommandError as exc:
+        QMessageBox.critical(parent, "Quick Push", f"Stage failed: {exc}")
+        return
+
+    # Anything to commit?
+    porcelain = runner.run(["status", "--porcelain=v2"], check=False, timeout=15)
+    has_staged = any(
+        line.startswith(("1 ", "2 ", "u "))
+        and len(line) > 2 and line[2] != "."
+        for line in porcelain.stdout.splitlines()
+    )
+    if not has_staged:
+        # Nothing staged — try push anyway in case there are unpushed commits.
+        push(parent, ctx)
+        return
+
+    # Build the message and let the user tweak.
+    s = repo_status(ctx)
+    message = commit_messages.for_quick_push(s)
+
+    edited, ok = _ask_text_multiline(
+        parent, "Quick Push — confirm message",
+        "Auto-generated commit message (edit if needed):",
+        message,
+    )
+    if not ok:
+        return
+    if not edited.strip():
+        edited = message
+    if not commit_messages.is_safe_for_argv(edited):
+        QMessageBox.warning(parent, "Quick Push",
+                            "Commit message contains unprintable characters.")
+        return
+
+    try:
+        commit_result = runner.run(["commit", "-m", edited], check=False, timeout=60)
+    except Exception as exc:  # noqa: BLE001
+        QMessageBox.critical(parent, "Quick Push", f"Commit failed: {exc}")
+        return
+    if not commit_result.ok:
+        QMessageBox.critical(parent, "Quick Push",
+                             commit_result.stderr or commit_result.stdout
+                             or f"git commit exited {commit_result.exit_code}")
+        return
+
+    # Push.
+    push_status = repo_status(ctx)
+    branch = push_status.branch if push_status is not None else None
+    args: list[str] = ["push", "--progress"]
+    if push_status is not None and push_status.upstream is None and branch:
+        args += ["--set-upstream", "origin", branch]
+    push_result = runner.run(args, check=False, timeout=300)
+    body = (commit_result.stdout + "\n" + commit_result.stderr
+            + "\n\n--- push ---\n"
+            + push_result.stdout + "\n" + push_result.stderr).strip()
+    _OutputDialog(title="Quick Push",
+                  body=body or "(no output)",
+                  ok=push_result.ok,
+                  parent=parent).exec()
+
+
+def _ask_text_multiline(parent: QWidget, title: str, prompt: str, default: str) -> tuple[str, bool]:
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.setModal(True)
+    dlg.resize(560, 240)
+    layout = QVBoxLayout(dlg)
+    layout.setContentsMargins(Spacing.LG, Spacing.LG, Spacing.LG, Spacing.LG)
+    layout.setSpacing(Spacing.SM)
+    layout.addWidget(QLabel(prompt, dlg))
+    field = QPlainTextEdit(dlg)
+    field.setPlainText(default)
+    layout.addWidget(field, 1)
+    buttons = QDialogButtonBox(
+        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+        parent=dlg,
+    )
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+    accepted = dlg.exec() == QDialog.DialogCode.Accepted
+    return field.toPlainText(), accepted
+
+
 def stash_save(parent: QWidget, ctx: GitContext) -> None:
     text, ok = _ask_text(parent, "Stash message", "Optional stash description:")
     if not ok:
@@ -375,6 +472,7 @@ __all__ = [
     "fetch",
     "pull",
     "push",
+    "quick_push",
     "stage_changes",
     "stash_save",
 ]

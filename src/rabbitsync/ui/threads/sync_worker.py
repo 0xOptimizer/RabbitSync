@@ -28,6 +28,9 @@ class SyncWorker(QObject):
         copy_folder: Path,
         writer: DbWriter,
         sample_rate: float = 0.01,
+        commit_on_sync: bool = False,
+        auto_push: bool = False,
+        target_branch: str | None = None,
     ) -> None:
         super().__init__()
         self._pair_id = pair_id
@@ -35,6 +38,9 @@ class SyncWorker(QObject):
         self._copy_folder = copy_folder
         self._writer = writer
         self._sample_rate = sample_rate
+        self._commit_on_sync = commit_on_sync
+        self._auto_push = auto_push
+        self._target_branch = target_branch
 
     @Slot()
     def run(self) -> None:
@@ -45,6 +51,9 @@ class SyncWorker(QObject):
                 copy_folder=self._copy_folder,
                 writer=self._writer,
                 sample_rate=self._sample_rate,
+                commit_on_sync=self._commit_on_sync,
+                auto_push=self._auto_push,
+                target_branch=self._target_branch,
             )
             self.started.emit(outcome.sync_id)
             self.finished.emit(outcome)

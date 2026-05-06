@@ -23,8 +23,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from rabbitsync.core import commit_messages
 from rabbitsync.core.backup import Snapshot, take as snapshot_take
 from rabbitsync.core.diff import DiffPlan, diff
+from rabbitsync.core.git import GitCommandError, GitRunner
+from rabbitsync.core.git_info import head_sha as git_head_sha, status as git_status
 from rabbitsync.core.git_resolve import resolve as resolve_git
 from rabbitsync.core.hashing import sha256_file, xxh64_file
 from rabbitsync.core.ignore import IgnoreRules, load_for_pair
@@ -53,6 +56,9 @@ class SyncOutcome:
     files_added: int
     files_modified: int
     files_quarantined: int
+    copy_commit_sha: str | None = None
+    pushed: bool = False
+    commit_message: str | None = None
 
 
 def perform(
@@ -63,6 +69,9 @@ def perform(
     writer: DbWriter,
     extra_ignore_files: tuple[Path, ...] = (),
     sample_rate: float = 0.01,
+    commit_on_sync: bool = False,
+    auto_push: bool = False,
+    target_branch: str | None = None,
 ) -> SyncOutcome:
     """Run a full sync from source to copy. Returns the outcome.
 
@@ -177,25 +186,60 @@ def perform(
         _verify_after(plan, writer=writer, sync_id=sync_id, source_folder=source_folder)
         _log.info("sync.verify.ok", sync_id=sync_id, files=plan.write_count)
 
+        # Optional commit + push on the copy side.
+        copy_commit_sha: str | None = None
+        commit_message: str | None = None
+        pushed = False
+        if commit_on_sync:
+            try:
+                copy_commit_sha, commit_message = _commit_on_copy(
+                    sync_id=sync_id,
+                    copy_folder=copy_folder,
+                    source_folder=source_folder,
+                    diff_plan=diff_plan,
+                    target_branch=target_branch,
+                    writer=writer,
+                )
+                if copy_commit_sha is not None and auto_push:
+                    pushed = _push_copy(
+                        sync_id=sync_id, copy_folder=copy_folder,
+                        target_branch=target_branch, writer=writer,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # Commit/push failure is loud but does NOT roll back the sync —
+                # the working tree is already converged + verified, the snapshot
+                # is intact, the user can retry the commit manually.
+                _log.error("sync.commit.failed",
+                           sync_id=sync_id, error=str(exc),
+                           error_type=type(exc).__name__)
+
         journal_mod.append(writer, sync_id=sync_id, action="close",
                            extra={"reason": "ok"})
         _log.info("sync.finalize", sync_id=sync_id)
+        source_sha = _safe_head_sha(source_folder)
         syncs_repo.finalize(
             writer, sync_id=sync_id, status="ok",
             files_added=len(diff_plan.adds),
             files_modified=len(diff_plan.modifies),
             files_quarantined=len(diff_plan.quarantines),
+            source_sha=source_sha,
+            copy_commit_sha=copy_commit_sha,
         )
         _append_receipt(writer, sync_id=sync_id, snapshot=snapshot)
         _log.info("sync.ok", sync_id=sync_id,
                   added=len(diff_plan.adds), modified=len(diff_plan.modifies),
-                  quarantined=len(diff_plan.quarantines))
+                  quarantined=len(diff_plan.quarantines),
+                  commit=copy_commit_sha[:7] if copy_commit_sha else None,
+                  pushed=pushed)
         return SyncOutcome(
             sync_id=sync_id, status="ok",
             snapshot=snapshot, diff_plan=diff_plan,
             files_added=len(diff_plan.adds),
             files_modified=len(diff_plan.modifies),
             files_quarantined=len(diff_plan.quarantines),
+            copy_commit_sha=copy_commit_sha,
+            pushed=pushed,
+            commit_message=commit_message,
         )
 
     except Exception as exc:
@@ -320,6 +364,132 @@ def _append_receipt(writer: DbWriter, *, sync_id: str, snapshot: Snapshot | None
         journal_hash=journal_hash,
         payload={"entry_count": len(entries)},
     )
+
+
+def _commit_on_copy(
+    *,
+    sync_id: str,
+    copy_folder: Path,
+    source_folder: Path,
+    diff_plan: DiffPlan,
+    target_branch: str | None,
+    writer: DbWriter,
+) -> tuple[str | None, str | None]:
+    """Stage all changes in copy and commit with an auto-generated message.
+
+    Returns ``(commit_sha, commit_message)`` on success; ``(None, None)`` if
+    there were no changes to commit. Refuses to commit when copy isn't a git
+    repo (returns None silently — the diff has already been written to disk).
+    """
+    copy_ctx = resolve_git(copy_folder)
+    if not copy_ctx.has_git or copy_ctx.git_root is None:
+        _log.info("sync.commit.skipped",
+                  sync_id=sync_id, reason="copy is not a git repo")
+        return None, None
+
+    runner = GitRunner(copy_ctx.git_root)
+
+    # Optionally switch to the target branch first. Refuse if dirty conflicts
+    # would arise — the user can resolve manually.
+    if target_branch:
+        cur_status = git_status(copy_ctx)
+        cur_branch = cur_status.branch if cur_status is not None else None
+        if cur_branch != target_branch:
+            _log.info("sync.commit.checkout",
+                      sync_id=sync_id, branch=target_branch,
+                      from_branch=cur_branch)
+            try:
+                runner.run(["checkout", target_branch], check=True, timeout=30)
+            except GitCommandError as exc:
+                _log.warning("sync.commit.checkout_failed",
+                             sync_id=sync_id, error=str(exc))
+                # Keep going on the current branch rather than abort.
+
+    _log.info("sync.commit.staging", sync_id=sync_id, subpath=copy_ctx.subpath or ".")
+    add_target = copy_ctx.subpath if copy_ctx.subpath else "."
+    runner.run(["add", "-A", "--", add_target], check=True, timeout=120)
+
+    # Anything staged?
+    porcelain = runner.run(["status", "--porcelain=v2"], check=False, timeout=15)
+    has_staged = any(
+        line.startswith(("1 ", "2 ", "u "))
+        and len(line) > 2 and line[2] != "."  # index status non-blank
+        for line in porcelain.stdout.splitlines()
+    )
+    if not has_staged:
+        _log.info("sync.commit.nothing_staged",
+                  sync_id=sync_id,
+                  reason="all working-tree changes already committed by another process")
+        return None, None
+
+    # Build the commit message.
+    source_ctx = resolve_git(source_folder)
+    src_sha = git_head_sha(source_ctx) if source_ctx.has_git else None
+    src_status = git_status(source_ctx) if source_ctx.has_git else None
+    src_branch = src_status.branch if src_status is not None else None
+    body = commit_messages.for_sync(
+        diff_plan, source_branch=src_branch, source_sha=src_sha,
+    )
+    message = commit_messages.render(body)
+    if not commit_messages.is_safe_for_argv(message):
+        message = commit_messages.render(commit_messages.for_sync(diff_plan))
+
+    _log.info("sync.commit.committing", sync_id=sync_id, message=message)
+    try:
+        runner.run(["commit", "-m", message], check=True, timeout=60)
+    except GitCommandError as exc:
+        _log.error("sync.commit.commit_failed", sync_id=sync_id, error=str(exc))
+        raise
+
+    new_sha_result = runner.run(["rev-parse", "HEAD"], check=False, timeout=15)
+    new_sha = new_sha_result.stdout.strip() or None
+    journal_mod.append(
+        writer, sync_id=sync_id, action="commit",
+        extra={"sha": new_sha, "message": message},
+    )
+    _log.info("sync.commit.ok",
+              sync_id=sync_id, sha=new_sha[:7] if new_sha else None)
+    return new_sha, message
+
+
+def _push_copy(
+    *, sync_id: str, copy_folder: Path,
+    target_branch: str | None, writer: DbWriter,
+) -> bool:
+    """Push the current branch in copy. Returns True on success."""
+    copy_ctx = resolve_git(copy_folder)
+    if not copy_ctx.has_git or copy_ctx.git_root is None:
+        return False
+    runner = GitRunner(copy_ctx.git_root)
+
+    s = git_status(copy_ctx)
+    branch = (s.branch if s is not None else None) or target_branch
+    args: list[str] = ["push", "--progress"]
+    if s is not None and s.upstream is None and branch:
+        args += ["--set-upstream", "origin", branch]
+
+    _log.info("sync.push.start", sync_id=sync_id, branch=branch)
+    try:
+        runner.run(args, check=True, timeout=300)
+    except GitCommandError as exc:
+        _log.error("sync.push.failed", sync_id=sync_id, error=str(exc))
+        raise
+    journal_mod.append(
+        writer, sync_id=sync_id, action="push",
+        extra={"branch": branch},
+    )
+    _log.info("sync.push.ok", sync_id=sync_id, branch=branch)
+    return True
+
+
+def _safe_head_sha(folder: Path) -> str | None:
+    try:
+        ctx = resolve_git(folder)
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return None
+    if not ctx.has_git:
+        return None
+    return git_head_sha(ctx)
 
 
 # Re-hash a snapshot blob from disk by streaming it. Convenience for callers.

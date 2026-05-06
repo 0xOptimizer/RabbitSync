@@ -84,6 +84,8 @@ class GitPane(QFrame):
         self._actions_btn.setIcon(icons.Icons.branch())
         menu = QMenu(self._actions_btn)
         for label, icon_fn, key in [
+            ("Quick Push (stage + commit + push)", icons.Icons.push, "quick_push"),
+            (None, None, None),
             ("Fetch", icons.Icons.fetch, "fetch"),
             ("Pull (ff-only)", icons.Icons.pull, "pull"),
             ("Push", icons.Icons.push, "push"),
@@ -92,6 +94,9 @@ class GitPane(QFrame):
             ("Branch…", icons.Icons.branch, "branch"),
             ("Stash…", icons.Icons.stash, "stash"),
         ]:
+            if label is None:
+                menu.addSeparator()
+                continue
             act = QAction(icon_fn(), label, menu)
             act.triggered.connect(lambda _checked=False, k=key: self._on_action(k))
             menu.addAction(act)

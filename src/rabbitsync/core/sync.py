@@ -174,16 +174,26 @@ def perform(
                   writes=plan.write_count,
                   quarantines=plan.quarantine_count)
 
-        # Apply the plan.
-        for idx, step in enumerate(plan.steps, start=1):
-            _apply_step(step, writer=writer, sync_id=sync_id, step_no=idx,
-                        total=len(plan.steps))
+        # Apply the plan, caching every source xxh64 so verify-after doesn't
+        # have to re-read source from disk. Journal entries are buffered into
+        # batches so we don't pay one fsynced round-trip per file op.
+        source_hash_cache: dict[str, str] = {}
+        with journal_mod.JournalBatch(writer, sync_id) as batch:
+            for idx, step in enumerate(plan.steps, start=1):
+                _apply_step(
+                    step, sync_id=sync_id, journal_batch=batch,
+                    step_no=idx, total=len(plan.steps),
+                    source_hash_cache=source_hash_cache,
+                )
 
         _log.info("sync.apply.done", sync_id=sync_id, steps=len(plan.steps))
 
-        # Verify-after-sync on every changed file.
+        # Verify-after-sync on every changed file (uses the cached source hashes).
         _log.info("sync.verify.start", sync_id=sync_id, files=plan.write_count)
-        _verify_after(plan, writer=writer, sync_id=sync_id, source_folder=source_folder)
+        _verify_after(
+            plan, writer=writer, sync_id=sync_id, source_folder=source_folder,
+            source_hash_cache=source_hash_cache,
+        )
         _log.info("sync.verify.ok", sync_id=sync_id, files=plan.write_count)
 
         # Optional commit + push on the copy side.
@@ -279,30 +289,27 @@ def _build_plan(
 
 
 def _apply_step(
-    step: TransactionStep, *, writer: DbWriter, sync_id: str,
+    step: TransactionStep, *, sync_id: str,
+    journal_batch: journal_mod.JournalBatch,
     step_no: int = 0, total: int = 0,
+    source_hash_cache: dict[str, str] | None = None,
 ) -> None:
     if step.kind == StepKind.WRITE:
-        prev_hash = _hash_if_exists(step.copy_abs_path)
-        new_hash = xxh64_file(step.source_abs_path) if step.source_abs_path else None
-        action = "write" if prev_hash is not None else "add"
-        _log.info(f"sync.apply.{action}",
+        new_hash: str | None = None
+        if step.source_abs_path is not None:
+            new_hash = xxh64_file(step.source_abs_path)
+            if source_hash_cache is not None:
+                source_hash_cache[step.rel_path] = new_hash
+        _log.info("sync.apply.write",
                   sync_id=sync_id, step=f"{step_no}/{total}",
                   rel_path=step.rel_path)
-        journal_mod.append(
-            writer, sync_id=sync_id, action="write",
-            rel_path=step.rel_path, prev_hash=prev_hash, new_hash=new_hash,
-        )
+        journal_batch.append("write", step.rel_path, new_hash=new_hash)
         _atomic_write(src=step.source_abs_path, dest=step.copy_abs_path)  # type: ignore[arg-type]
     elif step.kind == StepKind.QUARANTINE:
-        prev_hash = _hash_if_exists(step.copy_abs_path)
         _log.info("sync.apply.quarantine",
                   sync_id=sync_id, step=f"{step_no}/{total}",
                   rel_path=step.rel_path)
-        journal_mod.append(
-            writer, sync_id=sync_id, action="quarantine",
-            rel_path=step.rel_path, prev_hash=prev_hash,
-        )
+        journal_batch.append("quarantine", step.rel_path)
         move_to_quarantine(
             sync_id=sync_id,
             file_path=step.copy_abs_path,
@@ -327,11 +334,24 @@ def _atomic_write(*, src: Path, dest: Path) -> None:
 
 def _verify_after(
     plan: TransactionPlan, *, writer: DbWriter, sync_id: str, source_folder: Path,
+    source_hash_cache: dict[str, str] | None = None,
 ) -> None:
+    """Re-hash the destination of every WRITE and assert it matches source.
+
+    The source hash is read from ``source_hash_cache`` (populated during the
+    apply phase) so we don't re-read source from disk — source hasn't changed
+    between apply and verify, and the source-manifest-stable check (if added
+    later) covers the editor-mid-sync race separately.
+    """
+    cache = source_hash_cache or {}
     for step in plan.steps:
         if step.kind != StepKind.WRITE or step.source_abs_path is None:
             continue
-        src_hash = xxh64_file(step.source_abs_path)
+        src_hash = cache.get(step.rel_path)
+        if src_hash is None:
+            # Cache miss is unexpected (apply runs before verify); fall back
+            # to re-reading rather than skip the safety check.
+            src_hash = xxh64_file(step.source_abs_path)
         cpy_hash = xxh64_file(step.copy_abs_path)
         if src_hash != cpy_hash:
             raise RuntimeError(

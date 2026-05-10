@@ -80,6 +80,98 @@ def append(
     return writer.execute(_insert)
 
 
+# A pre-built journal entry that can be batched into one transaction.
+JournalAppend = tuple[
+    str,                # action
+    str | None,         # rel_path
+    str | None,         # prev_hash
+    str | None,         # new_hash
+    dict[str, object],  # extra
+]
+
+
+class JournalBatch:
+    """Buffer journal entries and flush in one transaction.
+
+    Reduces N round-trips through the writer thread (each with its own
+    fsync) to one per flush. Use as::
+
+        with JournalBatch(writer, sync_id) as batch:
+            for step in plan.steps:
+                batch.append("write", rel_path, ...)
+                # apply the file op …
+            # automatic flush at __exit__
+
+    Or call :meth:`flush` explicitly between phases.
+    """
+
+    # Tunable: flush at this many buffered entries even before exit. Keeps
+    # crash recovery's "lost work" bounded. 64 means at most 64 file ops can
+    # be in flight without a durable journal entry.
+    AUTO_FLUSH_AT = 64
+
+    def __init__(self, writer: DbWriter, sync_id: str) -> None:
+        self._writer = writer
+        self._sync_id = sync_id
+        self._buffer: list[JournalAppend] = []
+
+    def __enter__(self) -> JournalBatch:
+        return self
+
+    def __exit__(self, *_a: object) -> None:
+        self.flush()
+
+    def append(
+        self,
+        action: str,
+        rel_path: str | None = None,
+        *,
+        prev_hash: str | None = None,
+        new_hash: str | None = None,
+        extra: dict[str, object] | None = None,
+    ) -> None:
+        self._buffer.append((action, rel_path, prev_hash, new_hash, extra or {}))
+        if len(self._buffer) >= self.AUTO_FLUSH_AT:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._buffer:
+            return
+        entries = self._buffer
+        self._buffer = []
+        sync_id = self._sync_id
+        ts = _now()
+
+        def _insert_many(conn: sqlite3.Connection) -> None:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM journal_entries WHERE sync_id = ?;",
+                (sync_id,),
+            ).fetchone()
+            base_seq = int(row[0] or 0)
+            payload = [
+                (
+                    sync_id, base_seq + i + 1,
+                    action, rel_path, prev_hash, new_hash, ts,
+                    json.dumps(extra, sort_keys=True),
+                )
+                for i, (action, rel_path, prev_hash, new_hash, extra) in enumerate(entries)
+            ]
+            conn.execute("BEGIN IMMEDIATE;")
+            try:
+                conn.executemany(
+                    "INSERT INTO journal_entries "
+                    "(sync_id, seq, action, rel_path, prev_hash, new_hash, ts, extra_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?);",
+                    payload,
+                )
+                conn.execute("COMMIT;")
+            except Exception:
+                conn.execute("ROLLBACK;")
+                raise
+
+        self._writer.execute(_insert_many)
+
+
 def entries_for(writer: DbWriter, sync_id: str) -> tuple[JournalEntry, ...]:
     """Return every entry for a sync, ordered by seq."""
 
@@ -150,6 +242,8 @@ def actions_seen(entries: Iterable[JournalEntry]) -> set[str]:
 
 
 __all__ = [
+    "JournalAppend",
+    "JournalBatch",
     "JournalEntry",
     "actions_seen",
     "append",

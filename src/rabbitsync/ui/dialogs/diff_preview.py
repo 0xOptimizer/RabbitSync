@@ -1,33 +1,44 @@
 """Full-screen per-file diff viewer with hard caps so huge diffs don't crash.
 
-Selecting a file generates its diff lazily, capped at a fixed line+byte budget.
-Anything beyond the cap is replaced with a clear truncation marker — better
-than freezing the UI on a 50 MB file.
+The change list is rendered through a custom :class:`QAbstractTableModel`
+(via ``QTableView``) so a 50 000-row diff plan opens instantly — no
+per-row widget allocation, no per-insert layout pass.
+
+Selecting a file generates its diff lazily, capped at a fixed line+byte
+budget. Anything beyond the cap is replaced with a clear truncation marker.
 """
 
 from __future__ import annotations
 
 import difflib
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QSize,
+    Qt,
+    QTimer,
+)
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QDialog,
     QDialogButtonBox,
     QHeaderView,
     QPlainTextEdit,
     QPushButton,
     QSplitter,
-    QTreeWidget,
-    QTreeWidgetItem,
+    QTableView,
     QVBoxLayout,
     QWidget,
 )
 
 from rabbitsync.core.diff import DiffPlan
 from rabbitsync.ui import icons
-from rabbitsync.ui.theme import Spacing
+from rabbitsync.ui.theme import DARK, LIGHT, Spacing
 
 
 # Per-file caps — keeping these tight is what makes huge diffs survivable.
@@ -36,12 +47,88 @@ _DIFF_LINE_LIMIT = 5_000       # cap rendered diff to N lines
 _DIFF_BYTE_LIMIT = 1_000_000   # cap rendered diff to ~1 MB of text
 
 
+@dataclass(frozen=True)
+class _Row:
+    action: str   # 'add' | 'modify' | 'quarantine'
+    rel_path: str
+
+
+class _DiffPlanModel(QAbstractTableModel):
+    """Tiny tabular model wrapping a list of (action, rel_path) rows.
+
+    O(1) row access; populating from a 50k-row plan is microseconds vs
+    seconds for the equivalent QTreeWidget.
+    """
+
+    HEADERS = ("Action", "Path")
+
+    def __init__(
+        self,
+        rows: list[_Row],
+        *,
+        palette,  # noqa: ANN001
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._rows = rows
+        self._palette = palette
+
+    def rowCount(self, _parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008
+        return len(self._rows)
+
+    def columnCount(self, _parent: QModelIndex = QModelIndex()) -> int:  # noqa: B008
+        return 2
+
+    def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
+        if role != Qt.ItemDataRole.DisplayRole or orientation != Qt.Orientation.Horizontal:
+            return None
+        if 0 <= section < len(self.HEADERS):
+            return self.HEADERS[section]
+        return None
+
+    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):  # noqa: ANN201
+        if not index.isValid():
+            return None
+        row = self._rows[index.row()]
+        col = index.column()
+        if role == Qt.ItemDataRole.DisplayRole:
+            if col == 0:
+                return _ACTION_GLYPH.get(row.action, row.action)
+            return row.rel_path
+        if role == Qt.ItemDataRole.ForegroundRole and col == 0:
+            return QColor(_color_for_action(row.action, self._palette))
+        if role == Qt.ItemDataRole.UserRole:
+            return (row.action, row.rel_path)
+        if role == Qt.ItemDataRole.TextAlignmentRole and col == 0:
+            return Qt.AlignmentFlag.AlignCenter
+        return None
+
+    def row_at(self, index: int) -> _Row | None:
+        if 0 <= index < len(self._rows):
+            return self._rows[index]
+        return None
+
+
+_ACTION_GLYPH: dict[str, str] = {
+    "add": "+",
+    "modify": "~",
+    "quarantine": "−",
+}
+
+
+def _color_for_action(action: str, palette) -> str:  # noqa: ANN001
+    if action == "add":
+        return palette.success
+    if action == "quarantine":
+        return palette.danger
+    return palette.warning
+
+
 class DiffPreviewDialog(QDialog):
     """Full-screen diff viewer with optional Sync button.
 
     Pass ``on_sync`` to add a Sync button to the footer that closes the
-    dialog and invokes the callback (typically wired to the main window's
-    sync-clicked handler).
+    dialog and invokes the callback.
     """
 
     def __init__(
@@ -55,41 +142,47 @@ class DiffPreviewDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        _ = theme
         self.setWindowTitle("Preview diff")
         self.setModal(True)
         self.resize(1100, 640)
         self._source = source_folder
         self._copy = copy_folder
         self._on_sync = on_sync
-        # Pending render guard: if the user clicks rows quickly, only the
-        # latest selection's diff actually gets rendered to the view.
         self._pending_token = 0
+        palette = DARK if theme == "dark" else LIGHT
 
-        self._tree = QTreeWidget(self)
-        self._tree.setHeaderLabels(("Action", "Path"))
-        self._tree.setRootIsDecorated(False)
-        self._tree.setUniformRowHeights(True)
-        self._tree.setAlternatingRowColors(True)
-        self._tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self._tree.itemSelectionChanged.connect(self._on_selection)
-        for entry in plan.adds:
-            self._row("add", entry.rel_path)
-        for entry in plan.modifies:
-            self._row("modify", entry.rel_path)
-        for entry in plan.quarantines:
-            self._row("quarantine", entry.rel_path)
+        # Build the row list in one pass — O(N), no widget allocation.
+        rows: list[_Row] = []
+        rows.extend(_Row("add", e.rel_path) for e in plan.adds)
+        rows.extend(_Row("modify", e.rel_path) for e in plan.modifies)
+        rows.extend(_Row("quarantine", e.rel_path) for e in plan.quarantines)
+
+        self._model = _DiffPlanModel(rows, palette=palette, parent=self)
+        self._table = QTableView(self)
+        self._table.setModel(self._model)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
+        self._table.setWordWrap(False)
+        self._table.verticalHeader().setVisible(False)
+        # Uniform row height + a fixed action column = constant-time layout.
+        self._table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        self._table.verticalHeader().setDefaultSectionSize(20)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self._table.setColumnWidth(0, 56)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setStretchLastSection(False)
+        self._table.selectionModel().selectionChanged.connect(self._on_selection)
 
         self._view = QPlainTextEdit(self)
         self._view.setReadOnly(True)
         self._view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        # Hard ceiling on rendered blocks so even an under-cap diff that gets
-        # appended to repeatedly cannot exhaust memory.
         self._view.setMaximumBlockCount(_DIFF_LINE_LIMIT + 32)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        splitter.addWidget(self._tree)
+        splitter.addWidget(self._table)
         splitter.addWidget(self._view)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 3)
@@ -99,7 +192,7 @@ class DiffPreviewDialog(QDialog):
         layout.setSpacing(Spacing.SM)
         layout.addWidget(splitter, 1)
 
-        # Footer: Close on the left, Sync (primary) on the right when supplied.
+        # Footer.
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
         if on_sync is not None:
             sync_btn = QPushButton("Sync…", self)
@@ -114,37 +207,31 @@ class DiffPreviewDialog(QDialog):
                 b.clicked.connect(self.reject)
         layout.addWidget(buttons)
 
-        if self._tree.topLevelItemCount() > 0:
-            self._tree.setCurrentItem(self._tree.topLevelItem(0))
+        # Auto-select the first row so the diff pane isn't empty.
+        if self._model.rowCount() > 0:
+            first = self._model.index(0, 0)
+            self._table.setCurrentIndex(first)
 
     # -- Internals --------------------------------------------------------
 
-    def _row(self, action: str, rel_path: str) -> None:
-        item = QTreeWidgetItem([action, rel_path])
-        item.setData(0, Qt.ItemDataRole.UserRole, action)
-        item.setData(1, Qt.ItemDataRole.UserRole, rel_path)
-        self._tree.addTopLevelItem(item)
-
-    def _on_selection(self) -> None:
-        items = self._tree.selectedItems()
-        if not items:
+    def _on_selection(self, *_args: object) -> None:
+        idx = self._table.currentIndex()
+        if not idx.isValid():
             self._view.clear()
             return
-        item = items[0]
-        action = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
-        rel_path = str(item.data(1, Qt.ItemDataRole.UserRole) or "")
+        row = self._model.row_at(idx.row())
+        if row is None:
+            return
 
-        # Show a placeholder immediately so the UI feels responsive, then
-        # generate the real diff on the next event loop tick. This way even
-        # a slow-to-read file doesn't block the row click.
+        # Show a placeholder immediately, then render on the next event tick.
         self._view.setPlainText("(generating diff…)")
         self._pending_token += 1
         token = self._pending_token
-        QTimer.singleShot(0, lambda: self._render(token, action, rel_path))
+        QTimer.singleShot(0, lambda: self._render(token, row.action, row.rel_path))
 
     def _render(self, token: int, action: str, rel_path: str) -> None:
         if token != self._pending_token:
-            return  # superseded by a later selection
+            return
         text = self._build_diff_capped(action, rel_path)
         if token != self._pending_token:
             return
@@ -158,7 +245,6 @@ class DiffPreviewDialog(QDialog):
         if action == "quarantine":
             return self._render_one_side("copy", cpy_path, prefix="- ", header_path=rel_path)
 
-        # modify -> two-sided diff with a strict line+byte cap.
         src = self._read_text_or_marker(src_path)
         cpy = self._read_text_or_marker(cpy_path)
         if not isinstance(src, str) or not isinstance(cpy, str):
@@ -205,7 +291,6 @@ class DiffPreviewDialog(QDialog):
     ) -> str:
         from_lines = from_text.splitlines(keepends=True)
         to_lines = to_text.splitlines(keepends=True)
-        # Bail before doing any work if the inputs are absurd.
         if len(from_lines) + len(to_lines) > 200_000:
             return (
                 f"(diff suppressed: combined input is {len(from_lines):,} + "
@@ -256,8 +341,6 @@ class DiffPreviewDialog(QDialog):
             return f"could not read: {exc}"
 
     def _on_sync_clicked(self) -> None:
-        # Close first so the confirm dialog stacks on top of the main window
-        # rather than this preview, which would feel jarring at fullscreen.
         self.accept()
         if self._on_sync is not None:
             self._on_sync()

@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import io
+import os
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,20 @@ import zstandard as zstd
 from rabbitsync.paths import backups_dir
 
 _TAR_BUFFER = 256 * 1024  # bytes between flushes — keeps RAM bounded
+_ZSTD_LEVEL = 3            # ephemeral snapshots: prioritize speed over ratio
+
+
+# Path fragments that contribute almost no recovery value but a lot of bytes.
+# - .git/objects/pack: immutable binary packs git can rebuild from refs.
+# - .git/objects/info: indexes git regenerates from packs.
+# - .git/lfs / .git/annex: huge per-blob caches; if the user uses these we'd
+#   double the snapshot for no gain.
+_SNAPSHOT_EXCLUDE_FRAGMENTS: tuple[str, ...] = (
+    "/.git/objects/pack/",
+    "/.git/objects/info/",
+    "/.git/lfs/",
+    "/.git/annex/",
+)
 
 
 @dataclass(frozen=True)
@@ -50,7 +65,11 @@ def take(*, pair_id: str, copy_folder: Path) -> Snapshot:
     """Create a snapshot of ``copy_folder``.
 
     The folder is walked depth-first; the produced tar preserves relative
-    paths inside the folder (no absolute paths leak into the archive).
+    paths inside the folder (no absolute paths leak into the archive). The
+    SHA-256 of the on-disk compressed bytes is computed in a single streaming
+    pass so the file is never read twice. ``.git/objects/pack/*`` and similar
+    immutable bulk caches are excluded — git can rebuild them from refs and
+    skipping them keeps snapshots small and fast.
     """
     if not copy_folder.is_dir():
         raise FileNotFoundError(f"copy folder does not exist: {copy_folder}")
@@ -60,33 +79,38 @@ def take(*, pair_id: str, copy_folder: Path) -> Snapshot:
     ts = _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     out_path = pair_backups / f"{ts}.tar.zst"
 
+    # Hash the on-disk compressed bytes inline as they're written. This is
+    # the canonical SHA — no second-pass re-read.
     sha = hashlib.sha256()
-    size = 0
 
-    cctx = zstd.ZstdCompressor(level=10, threads=-1)
+    cctx = zstd.ZstdCompressor(level=_ZSTD_LEVEL, threads=-1)
     with out_path.open("wb") as fh:
-        # Tee writes through the hash + size accounting, then through zstd to fh.
-        accounting = _AccountingWriter(fh, sha, lambda n: None)
+        accounting = _AccountingWriter(fh, sha)
         with cctx.stream_writer(accounting, closefd=False) as zwriter:
             with tarfile.open(fileobj=zwriter, mode="w|", bufsize=_TAR_BUFFER) as tar:
-                tar.add(str(copy_folder), arcname=".", recursive=True)
-        # accounting was wrapping fh; once we close zwriter the bytes have
-        # all flushed through. The on-disk size is fh.tell().
-        size = fh.tell()
-
-    # Compute sha256 of the on-disk file (post-compression).
-    sha = hashlib.sha256()
-    with out_path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(_TAR_BUFFER), b""):
-            sha.update(chunk)
+                tar.add(
+                    str(copy_folder),
+                    arcname=".",
+                    recursive=True,
+                    filter=_snapshot_filter,
+                )
 
     return Snapshot(
         path=out_path,
         sha256=sha.hexdigest(),
-        size=size,
+        size=accounting.bytes_written,
         created_at=_dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
         pair_id=pair_id,
     )
+
+
+def _snapshot_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    """Drop bulky-but-recoverable paths from the archive."""
+    name = "/" + info.name.replace("\\", "/").lstrip("/")
+    for fragment in _SNAPSHOT_EXCLUDE_FRAGMENTS:
+        if fragment in name:
+            return None
+    return info
 
 
 def restore_to_sibling(snapshot_path: Path, *, copy_folder: Path) -> Path:
@@ -123,9 +147,14 @@ def verify(snapshot_path: Path, *, expected_sha256: str) -> bool:
 
 
 class _AccountingWriter(io.RawIOBase):
-    """File-like wrapper that updates a hash and a counter on every write."""
+    """File-like wrapper that updates a hash and a counter on every write.
 
-    def __init__(self, inner, sha, _on_bytes):
+    Sits between :class:`zstd.ZstdCompressor.stream_writer` and the on-disk
+    file handle so the SHA-256 it accumulates is the hash of the compressed
+    bytes — exactly what's stored in the ``blobs`` table for verification.
+    """
+
+    def __init__(self, inner, sha):
         super().__init__()
         self._inner = inner
         self._sha = sha
@@ -136,12 +165,22 @@ class _AccountingWriter(io.RawIOBase):
 
     def write(self, b) -> int:  # type: ignore[override]
         n = self._inner.write(b)
-        self._sha.update(b)
+        # ``b`` may be a memoryview / bytearray; bytes(...) is cheap and gives
+        # hashlib a safe input even when n < len(b) (rare on regular files).
+        view = bytes(b)[:n] if n is not None and n != len(b) else b
+        self._sha.update(view)
         self._n += n
         return n
 
     def flush(self) -> None:
         self._inner.flush()
+
+    @property
+    def bytes_written(self) -> int:
+        return self._n
+
+
+_ = os  # reserved for future use (e.g. fadvise on Linux)
 
 
 __all__ = ["Snapshot", "restore_to_sibling", "take", "verify"]

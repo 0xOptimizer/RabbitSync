@@ -382,6 +382,9 @@ class MainWindow(QMainWindow):
                 plan = diff(
                     source_folder=source, copy_folder=copy,
                     rules=rules, sample_rate=0,
+                    pair_id=pair.id,
+                    writer=self._writer,
+                    factory=self._factory,
                 )
             except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
                 _log.warning("ui.refresh.diff_failed",
@@ -461,7 +464,10 @@ class MainWindow(QMainWindow):
         source = Path(pair.source_path)
         copy = Path(pair.copy_path)
         rules = load_for_pair(source_folder=source, copy_folder=copy)
-        plan = diff(source_folder=source, copy_folder=copy, rules=rules, sample_rate=0)
+        plan = diff(
+            source_folder=source, copy_folder=copy, rules=rules, sample_rate=0,
+            pair_id=pair.id, writer=self._writer, factory=self._factory,
+        )
         from rabbitsync.paths import backups_dir
         snapshot_target = backups_dir() / pair.id
         # Initial-sync test: any prior receipt for this pair?
@@ -644,7 +650,10 @@ class MainWindow(QMainWindow):
         source = Path(pair.source_path)
         copy = Path(pair.copy_path)
         rules = load_for_pair(source_folder=source, copy_folder=copy)
-        plan = diff(source_folder=source, copy_folder=copy, rules=rules, sample_rate=0)
+        plan = diff(
+            source_folder=source, copy_folder=copy, rules=rules, sample_rate=0,
+            pair_id=pair.id, writer=self._writer, factory=self._factory,
+        )
         DiffPreviewDialog(
             plan=plan, source_folder=source, copy_folder=copy,
             on_sync=self._on_sync_clicked,

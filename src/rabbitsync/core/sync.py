@@ -141,6 +141,8 @@ def perform(
         copy_folder=copy_folder,
         rules=rules,
         sample_rate=sample_rate,
+        pair_id=pair_id,
+        writer=writer,
     )
     _log.info(
         "sync.diff.done",
@@ -164,6 +166,23 @@ def perform(
                "quarantines": len(diff_plan.quarantines)},
     )
 
+    # Fast-path noop BEFORE taking a snapshot. A snapshot is a tar+zstd of the
+    # entire copy folder; doing it just to back up "nothing changed" is what
+    # made repeat-syncs feel slow on big repos.
+    if diff_plan.is_noop:
+        _log.info("sync.noop", sync_id=sync_id,
+                  reason="source and copy are already in sync")
+        journal_mod.append(writer, sync_id=sync_id, action="close",
+                           extra={"reason": "noop"})
+        syncs_repo.finalize(writer, sync_id=sync_id, status="ok")
+        _append_receipt(writer, sync_id=sync_id, snapshot=None)
+        _emit(progress_cb, ProgressEvent(phase="done"))
+        return SyncOutcome(
+            sync_id=sync_id, status="ok",
+            snapshot=None, diff_plan=diff_plan,
+            files_added=0, files_modified=0, files_quarantined=0,
+        )
+
     snapshot: Snapshot | None = None
     try:
         _log.info("sync.snapshot.start", pair_id=pair_id, copy=str(copy_folder))
@@ -184,20 +203,6 @@ def perform(
             writer, sync_id=sync_id, action="snapshot",
             extra={"path": str(snapshot.path), "sha256": snapshot.sha256, "size": snapshot.size},
         )
-
-        if diff_plan.is_noop:
-            _log.info("sync.noop", sync_id=sync_id,
-                      reason="source and copy are already in sync")
-            journal_mod.append(writer, sync_id=sync_id, action="close",
-                               extra={"reason": "noop"})
-            syncs_repo.finalize(writer, sync_id=sync_id, status="ok")
-            _append_receipt(writer, sync_id=sync_id, snapshot=snapshot)
-            _emit(progress_cb, ProgressEvent(phase="done"))
-            return SyncOutcome(
-                sync_id=sync_id, status="ok",
-                snapshot=snapshot, diff_plan=diff_plan,
-                files_added=0, files_modified=0, files_quarantined=0,
-            )
 
         plan = _build_plan(sync_id=sync_id, diff_plan=diff_plan,
                            source_folder=source_folder, copy_folder=copy_folder)

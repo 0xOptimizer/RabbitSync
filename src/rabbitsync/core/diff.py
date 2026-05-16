@@ -29,6 +29,9 @@ from pathlib import Path
 
 from rabbitsync.core.hashing import xxh64_many
 from rabbitsync.core.ignore import IgnoreRules
+from rabbitsync.db.connection import ConnectionFactory
+from rabbitsync.db.repositories import file_cache_repo
+from rabbitsync.db.writer import DbWriter
 
 
 @dataclass(frozen=True)
@@ -120,6 +123,43 @@ def scan(folder: Path, rules: IgnoreRules, *, side: str) -> dict[str, FileFact]:
     return out
 
 
+def _hash_with_cache(
+    rel_paths: list[str],
+    manifest: dict[str, FileFact],
+    cache: dict[str, file_cache_repo.CachedEntry],
+    pending_writes: list[tuple[str, int, int, str]],
+) -> dict[Path, str]:
+    """Hash ``rel_paths`` via ``xxh64_many``, skipping cache hits.
+
+    Files whose ``(size, mtime_ns)`` match the cache and carry a non-NULL
+    hash are returned directly from the cache. Cache misses are hashed in a
+    single ``xxh64_many`` call and appended to ``pending_writes`` so the
+    caller can flush them to ``file_cache`` at the end.
+    """
+    out: dict[Path, str] = {}
+    miss_paths: list[Path] = []
+    miss_keys: list[str] = []
+    for k in rel_paths:
+        fact = manifest[k]
+        cached = cache.get(k)
+        if cached is not None:
+            c_size, c_mtime, c_hash = cached
+            if c_hash is not None and c_size == fact.size and c_mtime == fact.mtime_ns:
+                out[fact.abs_path] = c_hash
+                continue
+        miss_paths.append(fact.abs_path)
+        miss_keys.append(k)
+    if miss_paths:
+        new_hashes = xxh64_many(miss_paths)
+        for k in miss_keys:
+            fact = manifest[k]
+            h = new_hashes.get(fact.abs_path)
+            if h is not None:
+                out[fact.abs_path] = h
+                pending_writes.append((k, fact.size, fact.mtime_ns, h))
+    return out
+
+
 def diff(
     *,
     source_folder: Path,
@@ -127,15 +167,34 @@ def diff(
     rules: IgnoreRules,
     sample_rate: float = 0.01,
     rng_seed: int | None = None,
+    pair_id: str | None = None,
+    writer: DbWriter | None = None,
+    factory: ConnectionFactory | None = None,
 ) -> DiffPlan:
     """Compute the :class:`DiffPlan` between source and copy.
 
     ``sample_rate`` is the fraction of "unchanged" files to hash on both
     sides as a corruption canary. Set to 0 to disable sampling (e.g. for
     fast inner-loop checks).
+
+    When ``pair_id`` and ``factory`` are provided, the ``file_cache`` table
+    is consulted to skip re-hashing files whose ``(size, mtime_ns)`` haven't
+    changed since the last scan. When ``writer`` is also provided, newly
+    computed hashes are persisted back to the cache.
     """
     src_manifest = scan(source_folder, rules, side="source")
     cpy_manifest = scan(copy_folder, rules, side="copy")
+
+    # Load cached (size, mtime_ns, hash) for each side. Empty dicts when no
+    # pair context — keeps the rest of the function uniform.
+    if pair_id is not None:
+        src_cache = file_cache_repo.load_for_side(pair_id, "source", factory=factory)
+        cpy_cache = file_cache_repo.load_for_side(pair_id, "copy", factory=factory)
+    else:
+        src_cache = {}
+        cpy_cache = {}
+    src_pending: list[tuple[str, int, int, str]] = []
+    cpy_pending: list[tuple[str, int, int, str]] = []
 
     src_keys = set(src_manifest.keys())
     cpy_keys = set(cpy_manifest.keys())
@@ -186,8 +245,8 @@ def diff(
 
     # Hash the suspects to disambiguate modify vs unchanged.
     if suspects:
-        src_hashes = xxh64_many([src_manifest[k].abs_path for k in suspects])
-        cpy_hashes = xxh64_many([cpy_manifest[k].abs_path for k in suspects])
+        src_hashes = _hash_with_cache(suspects, src_manifest, src_cache, src_pending)
+        cpy_hashes = _hash_with_cache(suspects, cpy_manifest, cpy_cache, cpy_pending)
         for k in suspects:
             sh = src_hashes.get(src_manifest[k].abs_path)
             ch = cpy_hashes.get(cpy_manifest[k].abs_path)
@@ -208,8 +267,8 @@ def diff(
         rng = random.Random(rng_seed)
         n = max(1, int(len(unchanged) * sample_rate))
         sample = rng.sample(unchanged, min(n, len(unchanged)))
-        src_h = xxh64_many([src_manifest[k].abs_path for k in sample])
-        cpy_h = xxh64_many([cpy_manifest[k].abs_path for k in sample])
+        src_h = _hash_with_cache(sample, src_manifest, src_cache, src_pending)
+        cpy_h = _hash_with_cache(sample, cpy_manifest, cpy_cache, cpy_pending)
         for k in sample:
             sh = src_h.get(src_manifest[k].abs_path)
             ch = cpy_h.get(cpy_manifest[k].abs_path)
@@ -224,6 +283,19 @@ def diff(
                     source_size=s.size, source_mtime_ns=s.mtime_ns,
                     copy_size=c.size, copy_mtime_ns=c.mtime_ns,
                 ))
+
+    # Flush newly-computed hashes back to file_cache so the next scan can
+    # skip them. Best-effort: a cache write failure must not break the diff.
+    if pair_id is not None and writer is not None:
+        try:
+            file_cache_repo.upsert_hashes(
+                writer, pair_id=pair_id, side="source", entries=src_pending,
+            )
+            file_cache_repo.upsert_hashes(
+                writer, pair_id=pair_id, side="copy", entries=cpy_pending,
+            )
+        except Exception:  # noqa: BLE001 -- cache is an optimization, not load-bearing
+            pass
 
     # Sort modifies for deterministic output.
     modifies.sort(key=lambda c: c.rel_path)

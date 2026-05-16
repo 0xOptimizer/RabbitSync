@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +62,33 @@ class SyncOutcome:
     commit_message: str | None = None
 
 
+@dataclass(frozen=True)
+class ProgressEvent:
+    """One progress tick from the sync engine.
+
+    ``phase`` is the high-level stage (preflight/diff/snapshot/apply/verify/
+    commit/push/done). For per-file phases ``step_no`` / ``total`` count files
+    and ``rel_path`` names the file currently being acted on.
+    """
+
+    phase: str
+    step_no: int = 0
+    total: int = 0
+    rel_path: str | None = None
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
+
+
+def _emit(cb: ProgressCallback | None, ev: ProgressEvent) -> None:
+    if cb is None:
+        return
+    try:
+        cb(ev)
+    except Exception:  # noqa: BLE001 -- progress is best-effort, never fatal
+        pass
+
+
 def perform(
     *,
     pair_id: str,
@@ -72,6 +100,7 @@ def perform(
     commit_on_sync: bool = False,
     auto_push: bool = False,
     target_branch: str | None = None,
+    progress_cb: ProgressCallback | None = None,
 ) -> SyncOutcome:
     """Run a full sync from source to copy. Returns the outcome.
 
@@ -89,6 +118,7 @@ def perform(
     )
 
     _log.info("sync.preflight.start", source=str(source_folder), copy=str(copy_folder))
+    _emit(progress_cb, ProgressEvent(phase="preflight"))
     copy_ctx = resolve_git(copy_folder)
     pre = preflight_for_sync(
         source_folder=source_folder,
@@ -105,6 +135,7 @@ def perform(
 
     _log.info("sync.diff.scanning_source", path=str(source_folder))
     _log.info("sync.diff.scanning_copy", path=str(copy_folder))
+    _emit(progress_cb, ProgressEvent(phase="diff"))
     diff_plan = diff(
         source_folder=source_folder,
         copy_folder=copy_folder,
@@ -136,6 +167,7 @@ def perform(
     snapshot: Snapshot | None = None
     try:
         _log.info("sync.snapshot.start", pair_id=pair_id, copy=str(copy_folder))
+        _emit(progress_cb, ProgressEvent(phase="snapshot"))
         snapshot = snapshot_take(pair_id=pair_id, copy_folder=copy_folder)
         _log.info("sync.snapshot.written",
                   sync_id=sync_id, path=str(snapshot.path),
@@ -160,6 +192,7 @@ def perform(
                                extra={"reason": "noop"})
             syncs_repo.finalize(writer, sync_id=sync_id, status="ok")
             _append_receipt(writer, sync_id=sync_id, snapshot=snapshot)
+            _emit(progress_cb, ProgressEvent(phase="done"))
             return SyncOutcome(
                 sync_id=sync_id, status="ok",
                 snapshot=snapshot, diff_plan=diff_plan,
@@ -178,11 +211,16 @@ def perform(
         # have to re-read source from disk. Journal entries are buffered into
         # batches so we don't pay one fsynced round-trip per file op.
         source_hash_cache: dict[str, str] = {}
+        total_steps = len(plan.steps)
         with journal_mod.JournalBatch(writer, sync_id) as batch:
             for idx, step in enumerate(plan.steps, start=1):
+                _emit(progress_cb, ProgressEvent(
+                    phase="apply", step_no=idx, total=total_steps,
+                    rel_path=step.rel_path,
+                ))
                 _apply_step(
                     step, sync_id=sync_id, journal_batch=batch,
-                    step_no=idx, total=len(plan.steps),
+                    step_no=idx, total=total_steps,
                     source_hash_cache=source_hash_cache,
                 )
 
@@ -190,6 +228,7 @@ def perform(
 
         # Verify-after-sync on every changed file (uses the cached source hashes).
         _log.info("sync.verify.start", sync_id=sync_id, files=plan.write_count)
+        _emit(progress_cb, ProgressEvent(phase="verify", total=plan.write_count))
         _verify_after(
             plan, writer=writer, sync_id=sync_id, source_folder=source_folder,
             source_hash_cache=source_hash_cache,
@@ -202,6 +241,7 @@ def perform(
         pushed = False
         if commit_on_sync:
             try:
+                _emit(progress_cb, ProgressEvent(phase="commit"))
                 copy_commit_sha, commit_message = _commit_on_copy(
                     sync_id=sync_id,
                     copy_folder=copy_folder,
@@ -211,6 +251,7 @@ def perform(
                     writer=writer,
                 )
                 if copy_commit_sha is not None and auto_push:
+                    _emit(progress_cb, ProgressEvent(phase="push"))
                     pushed = _push_copy(
                         sync_id=sync_id, copy_folder=copy_folder,
                         target_branch=target_branch, writer=writer,
@@ -241,6 +282,7 @@ def perform(
                   quarantined=len(diff_plan.quarantines),
                   commit=copy_commit_sha[:7] if copy_commit_sha else None,
                   pushed=pushed)
+        _emit(progress_cb, ProgressEvent(phase="done"))
         return SyncOutcome(
             sync_id=sync_id, status="ok",
             snapshot=snapshot, diff_plan=diff_plan,
@@ -517,4 +559,4 @@ def snapshot_blob_sha(path: Path) -> str:
     return sha256_file(path)
 
 
-__all__ = ["SyncOutcome", "perform", "snapshot_blob_sha"]
+__all__ = ["ProgressCallback", "ProgressEvent", "SyncOutcome", "perform", "snapshot_blob_sha"]

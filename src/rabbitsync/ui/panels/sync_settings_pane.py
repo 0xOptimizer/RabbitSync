@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -22,6 +24,8 @@ class SyncSettingsPane(QFrame):
         super().__init__(parent)
         _ = theme
         self.setObjectName("SyncSettings")
+        self._on_changed: Callable[[], None] | None = None
+        self._suspend_change_events = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(Spacing.MD, Spacing.MD, Spacing.MD, Spacing.MD)
@@ -35,15 +39,18 @@ class SyncSettingsPane(QFrame):
         layout.addWidget(_section_label("Sync settings"))
 
         self._branch_combo = QComboBox(self)
+        self._branch_combo.currentIndexChanged.connect(self._emit_changed)
         layout.addWidget(_field_label("Target branch"))
         layout.addWidget(self._branch_combo)
 
         self._commit_chk = QCheckBox("commit on sync", self)
         self._commit_chk.setChecked(True)
+        self._commit_chk.toggled.connect(self._emit_changed)
         layout.addWidget(self._commit_chk)
 
         self._push_chk = QCheckBox("auto-push after commit", self)
         self._push_chk.setChecked(False)
+        self._push_chk.toggled.connect(self._emit_changed)
         layout.addWidget(self._push_chk)
 
         layout.addWidget(_field_label("Commit message template"))
@@ -68,10 +75,41 @@ class SyncSettingsPane(QFrame):
         self._summary.setText(f"+{adds}  ~{modifies}  -{quarantines}")
 
     def set_branches(self, branches: list[str], current: str | None = None) -> None:
-        self._branch_combo.clear()
-        self._branch_combo.addItems(branches)
-        if current is not None and current in branches:
-            self._branch_combo.setCurrentIndex(branches.index(current))
+        self._suspend_change_events = True
+        try:
+            self._branch_combo.clear()
+            self._branch_combo.addItems(branches)
+            if current is not None and current in branches:
+                self._branch_combo.setCurrentIndex(branches.index(current))
+        finally:
+            self._suspend_change_events = False
+
+    def set_state(
+        self,
+        *,
+        commit_on_sync: bool,
+        auto_push: bool,
+        target_branch: str | None,
+    ) -> None:
+        """Seed all toggles from a freshly-loaded pair, without firing on_changed."""
+        self._suspend_change_events = True
+        try:
+            self._commit_chk.setChecked(commit_on_sync)
+            self._push_chk.setChecked(auto_push)
+            if target_branch is not None:
+                idx = self._branch_combo.findText(target_branch)
+                if idx >= 0:
+                    self._branch_combo.setCurrentIndex(idx)
+        finally:
+            self._suspend_change_events = False
+
+    def set_on_changed(self, handler: Callable[[], None] | None) -> None:
+        self._on_changed = handler
+
+    def _emit_changed(self, *_args) -> None:  # noqa: ANN002
+        if self._suspend_change_events or self._on_changed is None:
+            return
+        self._on_changed()
 
     def set_conflicts(self, count: int) -> None:
         self._conflicts.setText("none" if count == 0 else f"{count} files")

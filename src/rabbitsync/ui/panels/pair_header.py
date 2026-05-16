@@ -114,6 +114,11 @@ class PairHeader(QFrame):
         bottom.addWidget(self._copy_chip, 1)
         layout.addLayout(bottom)  # type: ignore[union-attr]
         self._status_pill.set_status(status)
+        self._sync_btn.setEnabled(True)
+        self._actions_btn.setEnabled(True)
+
+    def set_status(self, status: PillStatus) -> None:
+        self._status_pill.set_status(status)
 
     def show_empty(self) -> None:
         self._label.setText("(no pair selected)")

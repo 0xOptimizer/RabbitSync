@@ -6,7 +6,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Slot
 
-from rabbitsync.core.sync import SyncOutcome, perform
+from rabbitsync.core.sync import ProgressEvent, SyncOutcome, perform
 from rabbitsync.db.writer import DbWriter
 
 
@@ -17,6 +17,7 @@ class SyncWorker(QObject):
     """
 
     started = Signal(str)        # sync_id
+    progress = Signal(object)    # ProgressEvent — queued across threads
     finished = Signal(object)    # SyncOutcome
     failed = Signal(str)         # human-readable error
 
@@ -42,6 +43,10 @@ class SyncWorker(QObject):
         self._auto_push = auto_push
         self._target_branch = target_branch
 
+    def _on_progress(self, ev: ProgressEvent) -> None:
+        # Signal.emit is thread-safe; Qt queues the delivery onto the main thread.
+        self.progress.emit(ev)
+
     @Slot()
     def run(self) -> None:
         try:
@@ -54,6 +59,7 @@ class SyncWorker(QObject):
                 commit_on_sync=self._commit_on_sync,
                 auto_push=self._auto_push,
                 target_branch=self._target_branch,
+                progress_cb=self._on_progress,
             )
             self.started.emit(outcome.sync_id)
             self.finished.emit(outcome)

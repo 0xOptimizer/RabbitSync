@@ -74,7 +74,38 @@ def delete(pair_id: str, writer: DbWriter) -> None:
     writer.execute(_do)
 
 
+def update_ui_state(
+    writer: DbWriter,
+    *,
+    pair_id: str,
+    commit_on_sync: bool,
+    auto_push: bool,
+    target_branch: str | None,
+) -> None:
+    """Persist the Sync-tab toggles for a pair.
+
+    Cheap, idempotent UPDATE — safe to call on every checkbox toggle.
+    """
+    now = _now_iso()
+
+    def _do(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE pairs SET "
+            "commit_on_sync = ?, auto_push = ?, target_branch = ?, updated_at = ? "
+            "WHERE id = ?;",
+            (int(commit_on_sync), int(auto_push), target_branch, now, pair_id),
+        )
+
+    writer.execute(_do)
+
+
 def _row_to_pair(row: sqlite3.Row) -> Pair:
+    # `commit_on_sync` was added in migration 0002. Tolerate older rows that
+    # somehow lack the column (e.g. a partially-rolled DB) by defaulting to True.
+    try:
+        commit_on_sync = bool(row["commit_on_sync"])
+    except (IndexError, KeyError):
+        commit_on_sync = True
     return Pair.model_validate(
         {
             "id": row["id"],
@@ -89,6 +120,7 @@ def _row_to_pair(row: sqlite3.Row) -> Pair:
             "ignore_files": json.loads(row["ignore_files_json"] or "[]"),
             "commit_message_template": row["commit_message_template"],
             "auto_push": bool(row["auto_push"]),
+            "commit_on_sync": commit_on_sync,
             "sync_check_interval_s": int(row["sync_check_interval_s"]),
             "secret_scan_enabled": bool(row["secret_scan_enabled"]),
             "snapshot_before_pipeline": bool(row["snapshot_before_pipeline"]),
@@ -98,4 +130,4 @@ def _row_to_pair(row: sqlite3.Row) -> Pair:
     )
 
 
-__all__ = ["create", "delete", "get", "list_all"]
+__all__ = ["create", "delete", "get", "list_all", "update_ui_state"]

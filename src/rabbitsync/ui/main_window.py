@@ -25,9 +25,9 @@ from PySide6.QtWidgets import (
 )
 
 from rabbitsync import __version__
-from rabbitsync.config.store import Settings, load_settings
+from rabbitsync.config.store import Settings, load_settings, save_settings
 from rabbitsync.core import disk_usage, retention
-from rabbitsync.core.diff import diff
+from rabbitsync.core.diff import DiffPlan, diff
 from rabbitsync.core.git_resolve import resolve as resolve_git
 from rabbitsync.core.ignore import load_for_pair
 from rabbitsync.core.pipeline import StepDef
@@ -72,6 +72,18 @@ from rabbitsync.ui.workspace.pair_view import PairView
 from rabbitsync.ui.workspace.repos_view import ReposView
 
 _log = get_logger("ui.main_window")
+
+
+def _pill_for_plan(plan: DiffPlan | None) -> PillStatus:
+    """Map a diff result to a status pill state.
+
+    ``None`` means the diff couldn't run (folder missing, permission denied, …).
+    """
+    if plan is None:
+        return PillStatus.BLOCKED
+    if plan.is_noop:
+        return PillStatus.IN_SYNC
+    return PillStatus.PENDING
 
 
 def _thread_running(t: QThread | None) -> bool:
@@ -120,6 +132,7 @@ class MainWindow(QMainWindow):
         self._gh_thread: QThread | None = None
         self._gh_worker: RefreshReposWorker | TestCredentialWorker | None = None
         self._toaster = Toaster(app_icon=icons.Icons.menu(), parent=self)
+        self._suppress_tab_refresh = False
 
         # --- Header strip with burger ---------------------------------
         header_strip = self._build_header_strip()
@@ -176,6 +189,10 @@ class MainWindow(QMainWindow):
         self._workspace_stack.addWidget(self._repos_view)     # 2
         self._workspace_stack.addWidget(self._accounts_view)  # 3
         self._workspace_stack.setCurrentWidget(self._empty_view)
+        # Persist per-pair Sync settings whenever the user toggles them.
+        self._pair_view.set_settings_changed_handler(self._on_pair_settings_changed)
+        # Refresh diff/pill on every tab switch within a pair workspace.
+        self._pair_view.currentChanged.connect(self._on_pair_view_tab_changed)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -213,6 +230,7 @@ class MainWindow(QMainWindow):
 
         self._refresh_sidebar_pairs()
         self._refresh_accounts_view()
+        self._maybe_restore_last_pair()
 
         # --- Auto sync-check timer -----------------------------------
         self._auto_check_timer = QTimer(self)
@@ -312,10 +330,25 @@ class MainWindow(QMainWindow):
             label=pair.label,
             source=Path(pair.source_path),
             copy=Path(pair.copy_path),
-            status=PillStatus.IN_SYNC,
+            status=PillStatus.PENDING,  # real state computed in _refresh_current_pair_view
+        )
+        # Seed the per-pair Sync settings before the refresh so the first
+        # populate_from_plan + diff use the right toggles.
+        self._pair_view.apply_pair_settings(
+            commit_on_sync=pair.commit_on_sync,
+            auto_push=pair.auto_push,
+            target_branch=pair.target_branch,
         )
         self._workspace_stack.setCurrentWidget(self._pair_view)
+        # Land on Overview every time a pair is selected. Suppress the tab-
+        # changed handler so we don't double-refresh; we call refresh explicitly.
+        self._suppress_tab_refresh = True
+        try:
+            self._pair_view.setCurrentIndex(0)
+        finally:
+            self._suppress_tab_refresh = False
         self._refresh_current_pair_view()
+        self._persist_last_pair_id(pair.id)
 
     def _on_sidebar_add(self, view: SidebarView) -> None:
         if view == SidebarView.PAIRS:
@@ -339,6 +372,27 @@ class MainWindow(QMainWindow):
         source = Path(pair.source_path)
         copy = Path(pair.copy_path)
         self._pair_view.show_pair(source_folder=source, copy_folder=copy)
+
+        # Compute the actual diff and drive both the Sync/Overview tabs and the
+        # status pill. Skip during an active sync so we don't fight the worker.
+        if not _thread_running(self._sync_thread):
+            plan: DiffPlan | None = None
+            try:
+                rules = load_for_pair(source_folder=source, copy_folder=copy)
+                plan = diff(
+                    source_folder=source, copy_folder=copy,
+                    rules=rules, sample_rate=0,
+                )
+            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
+                _log.warning("ui.refresh.diff_failed",
+                             pair_id=pair.id, error=str(exc),
+                             error_type=type(exc).__name__)
+            if plan is None:
+                self._pair_view.clear_sync_plan()
+            else:
+                self._pair_view.set_sync_plan(plan)
+            self._pair_header.set_status(_pill_for_plan(plan))
+
         # Pipelines list
         rows: list[dict] = []
         for p in pipelines_repo.list_pipelines(pair.id, factory=self._factory):
@@ -445,6 +499,7 @@ class MainWindow(QMainWindow):
         )
         self._sync_worker.moveToThread(self._sync_thread)
         self._sync_thread.started.connect(self._sync_worker.run)
+        self._sync_worker.progress.connect(self._on_sync_progress)
         self._sync_worker.finished.connect(self._on_sync_finished)
         self._sync_worker.failed.connect(self._on_sync_failed)
         self._sync_worker.finished.connect(self._sync_thread.quit)
@@ -452,10 +507,24 @@ class MainWindow(QMainWindow):
         self._sync_thread.finished.connect(self._sync_thread.deleteLater)
         self._sync_thread.start()
         self._status_bar.set_status("Syncing…")
+        self._status_bar.show_progress()
+        self._pair_view.show_sync_progress()
+        self._pair_header.set_status(PillStatus.SYNCING)
         # Auto-show the log dock so the user sees what's happening.
         self._log_dock.reveal()
 
+    def _on_sync_progress(self, ev) -> None:  # noqa: ANN001 -- ProgressEvent
+        # Forward the worker's progress event to both visible surfaces.
+        self._status_bar.update_progress(
+            phase=ev.phase, step_no=ev.step_no, total=ev.total, rel_path=ev.rel_path,
+        )
+        self._pair_view.update_sync_progress(
+            phase=ev.phase, step_no=ev.step_no, total=ev.total, rel_path=ev.rel_path,
+        )
+
     def _on_sync_finished(self, outcome) -> None:  # noqa: ANN001
+        self._status_bar.hide_progress()
+        self._pair_view.hide_sync_progress()
         commit_short = (
             outcome.copy_commit_sha[:7] if getattr(outcome, "copy_commit_sha", None) else None
         )
@@ -485,7 +554,10 @@ class MainWindow(QMainWindow):
         self._maybe_run_post_sync_pipelines(outcome)
 
     def _on_sync_failed(self, message: str) -> None:
+        self._status_bar.hide_progress()
+        self._pair_view.hide_sync_progress()
         self._status_bar.set_status("Sync failed")
+        self._pair_header.set_status(PillStatus.BLOCKED)
         QMessageBox.critical(self, "Sync failed", message)
         self._toaster.error("Sync failed", message)
 
@@ -554,7 +626,10 @@ class MainWindow(QMainWindow):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
-        pairs_repo.delete(self._current_pair_id, self._writer)
+        removed_id = self._current_pair_id
+        pairs_repo.delete(removed_id, self._writer)
+        if self._settings.last_pair_id == removed_id:
+            self._persist_last_pair_id(None)
         self._current_pair_id = None
         self._pair_header.show_empty()
         self._workspace_stack.setCurrentWidget(self._empty_view)
@@ -1050,6 +1125,56 @@ class MainWindow(QMainWindow):
         RecoveryPromptDialog(
             unfinished_sync_ids=ids, writer=self._writer, parent=self,
         ).exec()
+
+    # -- Per-pair settings persistence ------------------------------------
+
+    def _on_pair_settings_changed(self) -> None:
+        """User toggled commit-on-sync, auto-push, or target-branch on the Sync tab."""
+        if self._writer is None or self._current_pair_id is None:
+            return
+        try:
+            pairs_repo.update_ui_state(
+                self._writer,
+                pair_id=self._current_pair_id,
+                commit_on_sync=self._pair_view.commit_on_sync,
+                auto_push=self._pair_view.auto_push,
+                target_branch=self._pair_view.target_branch,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.error("ui.pair.settings.persist_failed",
+                       pair_id=self._current_pair_id, error=str(exc))
+
+    def _on_pair_view_tab_changed(self, _index: int) -> None:
+        """Refresh the diff when the user clicks between Overview/Sync/etc."""
+        if self._suppress_tab_refresh:
+            return
+        if self._current_pair_id is None:
+            return
+        if _thread_running(self._sync_thread):
+            return
+        self._refresh_current_pair_view()
+
+    def _persist_last_pair_id(self, pair_id: str | None) -> None:
+        if self._writer is None:
+            return
+        if self._settings.last_pair_id == pair_id:
+            return
+        self._settings.last_pair_id = pair_id
+        try:
+            save_settings(self._writer, self._settings)
+        except Exception as exc:  # noqa: BLE001
+            _log.error("ui.settings.persist_failed", error=str(exc))
+
+    def _maybe_restore_last_pair(self) -> None:
+        last = self._settings.last_pair_id
+        if not last:
+            return
+        pair = pairs_repo.get(last, factory=self._factory)
+        if pair is None:
+            # Stale id — forget it so we don't keep retrying.
+            self._persist_last_pair_id(None)
+            return
+        self._on_sidebar_item_selected(SidebarView.PAIRS, last)
 
     # -- Log dock toggle --------------------------------------------------
 

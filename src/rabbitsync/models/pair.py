@@ -23,6 +23,7 @@ class Pair(BaseModel):
     ignore_files: list[str] = Field(default_factory=list)
     commit_message_template: str = "sync: {src_branch}@{src_sha} — {n} files"
     auto_push: bool = False
+    commit_on_sync: bool = True
     sync_check_interval_s: int = 30
     secret_scan_enabled: bool = True
     snapshot_before_pipeline: bool = True

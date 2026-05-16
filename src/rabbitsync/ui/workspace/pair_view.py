@@ -11,6 +11,7 @@ from rabbitsync.core.git_resolve import GitContext
 from rabbitsync.core.git_resolve import resolve as resolve_git
 from rabbitsync.ui.tabs.git_pipelines_tab import GitPipelinesTab
 from rabbitsync.ui.tabs.history_data_tab import HistoryDataTab
+from rabbitsync.ui.tabs.overview_tab import OverviewTab
 from rabbitsync.ui.tabs.sync_tab import SyncTab
 
 
@@ -42,6 +43,11 @@ class PairView(QTabWidget):
         self.setDocumentMode(True)
         self.setMovable(False)
 
+        self._overview_tab = OverviewTab(
+            on_preview_diff=on_preview_diff,
+            on_sync_clicked=on_sync_clicked,
+            theme=theme,
+        )
         self._sync_tab = SyncTab(
             on_preview_diff=on_preview_diff,
             on_sync_clicked=on_sync_clicked,
@@ -65,9 +71,11 @@ class PairView(QTabWidget):
             theme=theme,
         )
 
+        self.addTab(self._overview_tab, "Overview")
         self.addTab(self._sync_tab, "Sync")
         self.addTab(self._git_tab, "Git & Pipelines")
         self.addTab(self._history_tab, "History & Data")
+        self.setCurrentIndex(0)
 
         self._on_history_restore = on_history_restore
         self._source_ctx: GitContext | None = None
@@ -97,12 +105,54 @@ class PairView(QTabWidget):
 
     def set_sync_plan(self, plan) -> None:  # noqa: ANN001
         self._sync_tab.populate_from_plan(plan)
+        self._overview_tab.populate_from_plan(plan)
+
+    def clear_sync_plan(self) -> None:
+        """Wipe the Sync + Overview tabs (e.g. when a folder went missing)."""
+        from rabbitsync.core.diff import DiffPlan
+        empty = DiffPlan()
+        self._sync_tab.populate_from_plan(empty)
+        self._overview_tab.clear_summary()
 
     def set_history_rows(self, rows: list[tuple[str, str, str]]) -> None:
         self._history_tab.populate_timeline(rows)
 
     def set_data_stats(self, **kwargs) -> None:  # noqa: ANN003
         self._history_tab.set_data_stats(**kwargs)
+
+    # -- Sync progress passthrough --------------------------------------
+
+    def show_sync_progress(self) -> None:
+        self._sync_tab.show_progress()
+
+    def update_sync_progress(
+        self, *, phase: str, step_no: int = 0, total: int = 0, rel_path: str | None = None,
+    ) -> None:
+        self._sync_tab.update_progress(
+            phase=phase, step_no=step_no, total=total, rel_path=rel_path,
+        )
+
+    def hide_sync_progress(self) -> None:
+        self._sync_tab.hide_progress()
+
+    # -- Per-pair settings state ----------------------------------------
+
+    def apply_pair_settings(
+        self,
+        *,
+        commit_on_sync: bool,
+        auto_push: bool,
+        target_branch: str | None,
+    ) -> None:
+        """Seed the Sync-tab settings pane from a freshly-loaded pair."""
+        self._sync_tab._settings.set_state(  # noqa: SLF001
+            commit_on_sync=commit_on_sync,
+            auto_push=auto_push,
+            target_branch=target_branch,
+        )
+
+    def set_settings_changed_handler(self, handler: Callable[[], None]) -> None:
+        self._sync_tab._settings.set_on_changed(handler)  # noqa: SLF001
 
     @property
     def source_ctx(self) -> GitContext | None:

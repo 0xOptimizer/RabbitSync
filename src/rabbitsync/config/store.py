@@ -26,6 +26,7 @@ class Settings:
     sync_check_interval_s: int = 30
     diff_sample_rate: float = 0.01
     allow_elevated_pipelines: bool = False
+    last_pair_id: str | None = None
 
 
 def load_settings(*, factory: ConnectionFactory | None = None) -> Settings:

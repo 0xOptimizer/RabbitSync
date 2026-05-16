@@ -80,6 +80,18 @@ class PairView(QTabWidget):
         self._on_history_restore = on_history_restore
         self._source_ctx: GitContext | None = None
         self._copy_ctx: GitContext | None = None
+        self._external_settings_handler: Callable[[], None] | None = None
+        self._mirroring_settings = False
+
+        # Mirror state between the two SyncSettingsPane instances so toggling
+        # on one updates the other immediately. The mirror suspends events on
+        # the receiver to avoid feedback loops.
+        self._sync_tab._settings.set_on_changed(  # noqa: SLF001
+            lambda: self._on_settings_changed(source="sync")
+        )
+        self._overview_tab.settings_pane.set_on_changed(
+            lambda: self._on_settings_changed(source="overview")
+        )
 
     def show_pair(self, *, source_folder: Path, copy_folder: Path) -> None:
         """Refresh all three tabs for the given pair."""
@@ -89,16 +101,18 @@ class PairView(QTabWidget):
         self._copy_ctx = copy_ctx
         self._git_tab.show_contexts(source=source_ctx, copy=copy_ctx)
 
-        # Populate the target-branch dropdown from copy's local branches.
+        # Populate the target-branch dropdown from copy's local branches on
+        # both settings panes (Sync tab + Overview tab).
         if copy_ctx.has_git:
             from rabbitsync.core.git_info import branches as list_branches, status as repo_status
 
             bs = [b.name for b in list_branches(copy_ctx)]
             cur = repo_status(copy_ctx)
             current = cur.branch if cur is not None else None
-            self._sync_tab._settings.set_branches(bs, current)  # noqa: SLF001
         else:
-            self._sync_tab._settings.set_branches([], None)     # noqa: SLF001
+            bs, current = [], None
+        for pane in self._settings_panes():
+            pane.set_branches(bs, current)
 
     def set_pipelines(self, rows: list[dict]) -> None:
         self._git_tab.set_pipelines(rows)
@@ -106,6 +120,15 @@ class PairView(QTabWidget):
     def set_sync_plan(self, plan) -> None:  # noqa: ANN001
         self._sync_tab.populate_from_plan(plan)
         self._overview_tab.populate_from_plan(plan)
+
+    def set_cached_counts(self, *, adds: int, modifies: int, quarantines: int) -> None:
+        """Show last-known counts on the cards/summaries while a fresh diff runs."""
+        self._overview_tab.set_counts(
+            adds=adds, modifies=modifies, quarantines=quarantines,
+        )
+        self._sync_tab._settings.show_summary(  # noqa: SLF001
+            adds=adds, modifies=modifies, quarantines=quarantines,
+        )
 
     def clear_sync_plan(self) -> None:
         """Wipe the Sync + Overview tabs (e.g. when a folder went missing)."""
@@ -144,15 +167,41 @@ class PairView(QTabWidget):
         auto_push: bool,
         target_branch: str | None,
     ) -> None:
-        """Seed the Sync-tab settings pane from a freshly-loaded pair."""
-        self._sync_tab._settings.set_state(  # noqa: SLF001
-            commit_on_sync=commit_on_sync,
-            auto_push=auto_push,
-            target_branch=target_branch,
-        )
+        """Seed both settings panes from a freshly-loaded pair."""
+        for pane in self._settings_panes():
+            pane.set_state(
+                commit_on_sync=commit_on_sync,
+                auto_push=auto_push,
+                target_branch=target_branch,
+            )
 
-    def set_settings_changed_handler(self, handler: Callable[[], None]) -> None:
-        self._sync_tab._settings.set_on_changed(handler)  # noqa: SLF001
+    def set_settings_changed_handler(self, handler: Callable[[], None] | None) -> None:
+        """Register the MainWindow handler called whenever either pane changes."""
+        self._external_settings_handler = handler
+
+    def _settings_panes(self):  # noqa: ANN202
+        return (self._sync_tab._settings, self._overview_tab.settings_pane)  # noqa: SLF001
+
+    def _on_settings_changed(self, *, source: str) -> None:
+        if self._mirroring_settings:
+            return
+        # Read the live state from the pane that fired, then mirror it onto
+        # the other pane with events suspended.
+        sync_pane = self._sync_tab._settings  # noqa: SLF001
+        overview_pane = self._overview_tab.settings_pane
+        src = sync_pane if source == "sync" else overview_pane
+        dst = overview_pane if source == "sync" else sync_pane
+        self._mirroring_settings = True
+        try:
+            dst.set_state(
+                commit_on_sync=src.commit_on_sync,
+                auto_push=src.auto_push,
+                target_branch=src.target_branch,
+            )
+        finally:
+            self._mirroring_settings = False
+        if self._external_settings_handler is not None:
+            self._external_settings_handler()
 
     @property
     def source_ctx(self) -> GitContext | None:

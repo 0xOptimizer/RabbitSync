@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import PurePosixPath
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QPushButton,
+    QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from rabbitsync.core.diff import DiffPlan
 from rabbitsync.ui import icons
+from rabbitsync.ui.panels.sync_settings_pane import SyncSettingsPane
 from rabbitsync.ui.theme import DARK, LIGHT, Palette, Radius, Spacing, Typography
 
 
@@ -162,6 +164,13 @@ class OverviewTab(QFrame):
         )
 
         self._list = _ChangesList(palette=palette, parent=self)
+        self._settings = SyncSettingsPane(theme=theme, parent=self)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.addWidget(self._list)
+        splitter.addWidget(self._settings)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
 
         # Bottom action bar.
         bottom = QFrame(self)
@@ -190,20 +199,34 @@ class OverviewTab(QFrame):
         outer.setSpacing(Spacing.MD)
         outer.addLayout(cards_row)
         outer.addWidget(section_title)
-        outer.addWidget(self._list, 1)
+        outer.addWidget(splitter, 1)
         outer.addWidget(bottom)
 
     def populate_from_plan(self, plan: DiffPlan) -> None:
-        self._new_card.set_count(len(plan.adds))
-        self._mod_card.set_count(len(plan.modifies))
-        self._quar_card.set_count(len(plan.quarantines))
+        self.set_counts(
+            adds=len(plan.adds),
+            modifies=len(plan.modifies),
+            quarantines=len(plan.quarantines),
+        )
         self._list.populate(plan)
 
+    def set_counts(self, *, adds: int, modifies: int, quarantines: int) -> None:
+        """Update only the cards + settings summary, without touching the list.
+
+        Used to show cached counts immediately on pair selection.
+        """
+        self._new_card.set_count(adds)
+        self._mod_card.set_count(modifies)
+        self._quar_card.set_count(quarantines)
+        self._settings.show_summary(adds=adds, modifies=modifies, quarantines=quarantines)
+
     def clear_summary(self) -> None:
-        self._new_card.set_count(0)
-        self._mod_card.set_count(0)
-        self._quar_card.set_count(0)
+        self.set_counts(adds=0, modifies=0, quarantines=0)
         self._list.clear()
+
+    @property
+    def settings_pane(self) -> SyncSettingsPane:
+        return self._settings
 
 
 __all__ = ["OverviewTab"]

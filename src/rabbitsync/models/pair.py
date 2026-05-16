@@ -27,6 +27,10 @@ class Pair(BaseModel):
     sync_check_interval_s: int = 30
     secret_scan_enabled: bool = True
     snapshot_before_pipeline: bool = True
+    last_diff_adds: int = 0
+    last_diff_modifies: int = 0
+    last_diff_quarantines: int = 0
+    last_diff_at: str | None = None
     created_at: _dt.datetime
     updated_at: _dt.datetime
 

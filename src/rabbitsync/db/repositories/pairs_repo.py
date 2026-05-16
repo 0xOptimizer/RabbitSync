@@ -99,13 +99,42 @@ def update_ui_state(
     writer.execute(_do)
 
 
+def update_diff_summary(
+    writer: DbWriter,
+    *,
+    pair_id: str,
+    adds: int,
+    modifies: int,
+    quarantines: int,
+) -> None:
+    """Cache the most recent diff counts on the pair row.
+
+    Used by the UI to show the cards instantly on pair selection while a
+    fresh background diff is running. Does not touch updated_at — this is
+    metadata, not a user-facing edit.
+    """
+    now = _now_iso()
+
+    def _do(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE pairs SET "
+            "last_diff_adds = ?, last_diff_modifies = ?, "
+            "last_diff_quarantines = ?, last_diff_at = ? "
+            "WHERE id = ?;",
+            (int(adds), int(modifies), int(quarantines), now, pair_id),
+        )
+
+    writer.execute(_do)
+
+
 def _row_to_pair(row: sqlite3.Row) -> Pair:
-    # `commit_on_sync` was added in migration 0002. Tolerate older rows that
-    # somehow lack the column (e.g. a partially-rolled DB) by defaulting to True.
-    try:
-        commit_on_sync = bool(row["commit_on_sync"])
-    except (IndexError, KeyError):
-        commit_on_sync = True
+    # Tolerate older rows missing columns from later migrations.
+    def _opt(key: str, default):  # noqa: ANN001, ANN202
+        try:
+            return row[key]
+        except (IndexError, KeyError):
+            return default
+
     return Pair.model_validate(
         {
             "id": row["id"],
@@ -120,14 +149,18 @@ def _row_to_pair(row: sqlite3.Row) -> Pair:
             "ignore_files": json.loads(row["ignore_files_json"] or "[]"),
             "commit_message_template": row["commit_message_template"],
             "auto_push": bool(row["auto_push"]),
-            "commit_on_sync": commit_on_sync,
+            "commit_on_sync": bool(_opt("commit_on_sync", 1)),
             "sync_check_interval_s": int(row["sync_check_interval_s"]),
             "secret_scan_enabled": bool(row["secret_scan_enabled"]),
             "snapshot_before_pipeline": bool(row["snapshot_before_pipeline"]),
+            "last_diff_adds": int(_opt("last_diff_adds", 0)),
+            "last_diff_modifies": int(_opt("last_diff_modifies", 0)),
+            "last_diff_quarantines": int(_opt("last_diff_quarantines", 0)),
+            "last_diff_at": _opt("last_diff_at", None),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
     )
 
 
-__all__ = ["create", "delete", "get", "list_all", "update_ui_state"]
+__all__ = ["create", "delete", "get", "list_all", "update_diff_summary", "update_ui_state"]

@@ -62,6 +62,7 @@ from rabbitsync.ui.panels.toast import Toaster
 from rabbitsync.ui.sidebar import Sidebar, SidebarView
 from rabbitsync.ui.theme import DARK, LIGHT, Spacing, Window
 from rabbitsync.ui.threads.clone_worker import CloneWorker
+from rabbitsync.ui.threads.diff_worker import DiffWorker
 from rabbitsync.ui.threads.github_worker import RefreshReposWorker, TestCredentialWorker
 from rabbitsync.ui.threads.pipeline_worker import PipelineWorker
 from rabbitsync.ui.threads.sync_worker import SyncWorker
@@ -124,6 +125,9 @@ class MainWindow(QMainWindow):
         self._current_pair_id: str | None = None
         self._sync_thread: QThread | None = None
         self._sync_worker: SyncWorker | None = None
+        self._diff_thread: QThread | None = None
+        self._diff_worker: DiffWorker | None = None
+        self._diff_token: int = 0
         self._clone_thread: QThread | None = None
         self._clone_worker: CloneWorker | None = None
         self._clone_dialog: CloneDialog | None = None
@@ -373,28 +377,18 @@ class MainWindow(QMainWindow):
         copy = Path(pair.copy_path)
         self._pair_view.show_pair(source_folder=source, copy_folder=copy)
 
-        # Compute the actual diff and drive both the Sync/Overview tabs and the
-        # status pill. Skip during an active sync so we don't fight the worker.
+        # Show cached diff counts immediately so the cards/summary aren't blank
+        # while the real diff runs in the background.
+        self._pair_view.set_cached_counts(
+            adds=pair.last_diff_adds,
+            modifies=pair.last_diff_modifies,
+            quarantines=pair.last_diff_quarantines,
+        )
+
+        # Kick off the diff in a background thread. Skip if a sync is already
+        # running (it computes its own diff).
         if not _thread_running(self._sync_thread):
-            plan: DiffPlan | None = None
-            try:
-                rules = load_for_pair(source_folder=source, copy_folder=copy)
-                plan = diff(
-                    source_folder=source, copy_folder=copy,
-                    rules=rules, sample_rate=0,
-                    pair_id=pair.id,
-                    writer=self._writer,
-                    factory=self._factory,
-                )
-            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError) as exc:
-                _log.warning("ui.refresh.diff_failed",
-                             pair_id=pair.id, error=str(exc),
-                             error_type=type(exc).__name__)
-            if plan is None:
-                self._pair_view.clear_sync_plan()
-            else:
-                self._pair_view.set_sync_plan(plan)
-            self._pair_header.set_status(_pill_for_plan(plan))
+            self._launch_diff(pair_id=pair.id, source=source, copy=copy)
 
         # Pipelines list
         rows: list[dict] = []
@@ -529,6 +523,10 @@ class MainWindow(QMainWindow):
         )
 
     def _on_sync_finished(self, outcome) -> None:  # noqa: ANN001
+        # Clear the worker handle so the post-sync refresh actually runs the
+        # diff (the refresh skips diff while sync is flagged as running).
+        self._sync_thread = None
+        self._sync_worker = None
         self._status_bar.hide_progress()
         self._pair_view.hide_sync_progress()
         commit_short = (
@@ -560,6 +558,8 @@ class MainWindow(QMainWindow):
         self._maybe_run_post_sync_pipelines(outcome)
 
     def _on_sync_failed(self, message: str) -> None:
+        self._sync_thread = None
+        self._sync_worker = None
         self._status_bar.hide_progress()
         self._pair_view.hide_sync_progress()
         self._status_bar.set_status("Sync failed")
@@ -1134,6 +1134,62 @@ class MainWindow(QMainWindow):
         RecoveryPromptDialog(
             unfinished_sync_ids=ids, writer=self._writer, parent=self,
         ).exec()
+
+    # -- Async diff worker ------------------------------------------------
+
+    def _launch_diff(self, *, pair_id: str, source: Path, copy: Path) -> None:
+        """Compute the diff on a background thread; result arrives via signal."""
+        self._diff_token += 1
+        token = self._diff_token
+        self._diff_thread = QThread(self)
+        self._diff_worker = DiffWorker(
+            token=token,
+            pair_id=pair_id,
+            source_folder=source,
+            copy_folder=copy,
+            writer=self._writer,
+            factory=self._factory,
+        )
+        self._diff_worker.moveToThread(self._diff_thread)
+        self._diff_thread.started.connect(self._diff_worker.run)
+        self._diff_worker.finished.connect(self._on_diff_finished)
+        self._diff_worker.failed.connect(self._on_diff_failed)
+        self._diff_worker.finished.connect(self._diff_thread.quit)
+        self._diff_worker.failed.connect(self._diff_thread.quit)
+        self._diff_thread.finished.connect(self._diff_thread.deleteLater)
+        self._diff_thread.start()
+
+    def _on_diff_finished(self, token: int, plan) -> None:  # noqa: ANN001
+        # Drop stale results — user may have switched pair while diff was running.
+        if token != self._diff_token:
+            return
+        if self._current_pair_id is None:
+            return
+        if plan is None:
+            self._pair_view.clear_sync_plan()
+        else:
+            self._pair_view.set_sync_plan(plan)
+            # Cache the counts on the pair row so the next selection has
+            # something to show instantly.
+            if self._writer is not None:
+                try:
+                    pairs_repo.update_diff_summary(
+                        self._writer,
+                        pair_id=self._current_pair_id,
+                        adds=len(plan.adds),
+                        modifies=len(plan.modifies),
+                        quarantines=len(plan.quarantines),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log.error("ui.diff.persist_failed",
+                               pair_id=self._current_pair_id, error=str(exc))
+        self._pair_header.set_status(_pill_for_plan(plan))
+
+    def _on_diff_failed(self, token: int, message: str) -> None:
+        if token != self._diff_token:
+            return
+        _log.warning("ui.diff.failed", error=message)
+        self._pair_header.set_status(PillStatus.BLOCKED)
 
     # -- Per-pair settings persistence ------------------------------------
 

@@ -24,14 +24,19 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import io
+import json
 import os
 import tarfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import zstandard as zstd
 
+from rabbitsync.logging.setup import get_logger
 from rabbitsync.paths import backups_dir
+
+_log = get_logger("core.backup")
 
 _TAR_BUFFER = 256 * 1024  # bytes between flushes — keeps RAM bounded
 _ZSTD_LEVEL = 3            # ephemeral snapshots: prioritize speed over ratio
@@ -61,15 +66,24 @@ class Snapshot:
     pair_id: str
 
 
-def take(*, pair_id: str, copy_folder: Path) -> Snapshot:
+def take(
+    *,
+    pair_id: str,
+    copy_folder: Path,
+    include_paths: Iterable[str] | None = None,
+) -> Snapshot:
     """Create a snapshot of ``copy_folder``.
 
-    The folder is walked depth-first; the produced tar preserves relative
-    paths inside the folder (no absolute paths leak into the archive). The
-    SHA-256 of the on-disk compressed bytes is computed in a single streaming
-    pass so the file is never read twice. ``.git/objects/pack/*`` and similar
-    immutable bulk caches are excluded — git can rebuild them from refs and
-    skipping them keeps snapshots small and fast.
+    When ``include_paths`` is ``None`` (legacy behavior), the whole folder is
+    tarred. When provided, only those relative paths are tarred — used to
+    snapshot just the files a sync is about to overwrite, which is what
+    actually needs backing up. Added files don't need a snapshot (rollback =
+    delete) and quarantined files already get preserved in ``data/quarantine``.
+
+    The SHA-256 of the on-disk compressed bytes is computed in a single
+    streaming pass so the file is never read twice. ``.git/objects/pack/*``
+    and similar immutable bulk caches are excluded — git can rebuild them
+    from refs and skipping them keeps full snapshots small and fast.
     """
     if not copy_folder.is_dir():
         raise FileNotFoundError(f"copy folder does not exist: {copy_folder}")
@@ -88,12 +102,31 @@ def take(*, pair_id: str, copy_folder: Path) -> Snapshot:
         accounting = _AccountingWriter(fh, sha)
         with cctx.stream_writer(accounting, closefd=False) as zwriter:
             with tarfile.open(fileobj=zwriter, mode="w|", bufsize=_TAR_BUFFER) as tar:
-                tar.add(
-                    str(copy_folder),
-                    arcname=".",
-                    recursive=True,
-                    filter=_snapshot_filter,
-                )
+                if include_paths is None:
+                    tar.add(
+                        str(copy_folder),
+                        arcname=".",
+                        recursive=True,
+                        filter=_snapshot_filter,
+                    )
+                else:
+                    for rel in include_paths:
+                        abs_path = copy_folder / rel
+                        if not abs_path.is_file():
+                            # File vanished between diff and snapshot. Sync
+                            # will recreate it from source (or fail loudly
+                            # there). No backup possible; nothing to undo.
+                            _log.warning(
+                                "snapshot.skip_missing",
+                                pair_id=pair_id, rel_path=rel,
+                            )
+                            continue
+                        tar.add(
+                            str(abs_path),
+                            arcname=rel,
+                            recursive=False,
+                            filter=_snapshot_filter,
+                        )
 
     return Snapshot(
         path=out_path,
@@ -102,6 +135,25 @@ def take(*, pair_id: str, copy_folder: Path) -> Snapshot:
         created_at=_dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
         pair_id=pair_id,
     )
+
+
+def write_manifest(snapshot_path: Path, manifest: dict) -> Path:
+    """Write a sidecar ``<ts>.manifest.json`` next to a snapshot tar.
+
+    The manifest captures the full diff (adds + modifies + quarantines) for
+    this sync, enabling symmetric rollback later: the tar restores modified
+    files, the manifest's ``adds`` list says what to delete, and the
+    ``quarantines`` list points back to ``data/quarantine`` entries.
+    """
+    # snapshot_path = .../<ts>.tar.zst  →  .../<ts>.manifest.json
+    name = snapshot_path.name
+    if name.endswith(".tar.zst"):
+        base = name[: -len(".tar.zst")]
+    else:
+        base = snapshot_path.stem
+    out = snapshot_path.parent / f"{base}.manifest.json"
+    out.write_text(json.dumps(manifest, sort_keys=True, indent=2), encoding="utf-8")
+    return out
 
 
 def _snapshot_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -183,4 +235,4 @@ class _AccountingWriter(io.RawIOBase):
 _ = os  # reserved for future use (e.g. fadvise on Linux)
 
 
-__all__ = ["Snapshot", "restore_to_sibling", "take", "verify"]
+__all__ = ["Snapshot", "restore_to_sibling", "take", "verify", "write_manifest"]

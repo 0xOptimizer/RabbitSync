@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rabbitsync.core import commit_messages
-from rabbitsync.core.backup import Snapshot, take as snapshot_take
+from rabbitsync.core.backup import Snapshot, take as snapshot_take, write_manifest
 from rabbitsync.core.diff import DiffPlan, diff
 from rabbitsync.core.git import GitCommandError, GitRunner
 from rabbitsync.core.git_info import head_sha as git_head_sha, status as git_status
@@ -183,26 +183,70 @@ def perform(
             files_added=0, files_modified=0, files_quarantined=0,
         )
 
+    # Selective snapshot: only files we're about to overwrite need backing up.
+    # Added files don't (rollback = delete); quarantined files don't (the
+    # quarantine dir IS the backup). If there are no modifies, skip snapshot
+    # entirely — this is the path that turned a 90%-of-runtime snapshot of
+    # the whole copy folder into a no-op for adds-only or quarantines-only
+    # syncs.
+    modified_paths = [m.rel_path for m in diff_plan.modifies]
     snapshot: Snapshot | None = None
     try:
-        _log.info("sync.snapshot.start", pair_id=pair_id, copy=str(copy_folder))
-        _emit(progress_cb, ProgressEvent(phase="snapshot"))
-        snapshot = snapshot_take(pair_id=pair_id, copy_folder=copy_folder)
-        _log.info("sync.snapshot.written",
-                  sync_id=sync_id, path=str(snapshot.path),
-                  size_bytes=snapshot.size, sha256=snapshot.sha256[:12])
-        blob_id = blobs_repo.insert(
-            writer,
-            kind="snapshot",
-            path=snapshot.path,
-            sha256=snapshot.sha256,
-            size=snapshot.size,
-        )
-        syncs_repo.attach_snapshot(writer, sync_id=sync_id, snapshot_blob_id=blob_id)
-        journal_mod.append(
-            writer, sync_id=sync_id, action="snapshot",
-            extra={"path": str(snapshot.path), "sha256": snapshot.sha256, "size": snapshot.size},
-        )
+        if modified_paths:
+            _log.info("sync.snapshot.start",
+                      pair_id=pair_id, copy=str(copy_folder),
+                      kind="selective", files=len(modified_paths))
+            _emit(progress_cb, ProgressEvent(phase="snapshot"))
+            snapshot = snapshot_take(
+                pair_id=pair_id,
+                copy_folder=copy_folder,
+                include_paths=modified_paths,
+            )
+            _log.info("sync.snapshot.written",
+                      sync_id=sync_id, path=str(snapshot.path),
+                      size_bytes=snapshot.size, sha256=snapshot.sha256[:12])
+            # Sidecar manifest so a future rollback knows the full picture:
+            # which files to delete (adds), which to extract from the tar
+            # (modifies), which to un-quarantine.
+            manifest = {
+                "sync_id": sync_id,
+                "pair_id": pair_id,
+                "snapshot_kind": "selective",
+                "snapshot_sha256": snapshot.sha256,
+                "snapshot_path": str(snapshot.path),
+                "created_at": snapshot.created_at,
+                "adds": [a.rel_path for a in diff_plan.adds],
+                "modifies": modified_paths,
+                "quarantines": [q.rel_path for q in diff_plan.quarantines],
+            }
+            try:
+                write_manifest(snapshot.path, manifest)
+            except OSError as exc:
+                _log.warning("sync.snapshot.manifest_failed",
+                             sync_id=sync_id, error=str(exc))
+            blob_id = blobs_repo.insert(
+                writer,
+                kind="snapshot",
+                path=snapshot.path,
+                sha256=snapshot.sha256,
+                size=snapshot.size,
+            )
+            syncs_repo.attach_snapshot(writer, sync_id=sync_id, snapshot_blob_id=blob_id)
+            journal_mod.append(
+                writer, sync_id=sync_id, action="snapshot",
+                extra={"path": str(snapshot.path), "sha256": snapshot.sha256,
+                       "size": snapshot.size, "kind": "selective",
+                       "files": len(modified_paths)},
+            )
+        else:
+            _log.info("sync.snapshot.skipped",
+                      sync_id=sync_id,
+                      reason="no modifies — adds/quarantines don't need a snapshot")
+            journal_mod.append(
+                writer, sync_id=sync_id, action="snapshot",
+                extra={"skipped": True,
+                       "reason": "no modifies — adds/quarantines don't need a snapshot"},
+            )
 
         plan = _build_plan(sync_id=sync_id, diff_plan=diff_plan,
                            source_folder=source_folder, copy_folder=copy_folder)
